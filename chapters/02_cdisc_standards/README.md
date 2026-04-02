@@ -1,314 +1,266 @@
-# Chapter 2: CDISC Standards in Code
+# Chapter 2: Inspect PHARM-001's SDTM
 
-*SDTM and ADaM structure in R. Controlled terminology. Metadata with {metacore}.*
-
----
-
-## CDISC in a Nutshell (for R Programmers)
-
-You know what CDISC is. Here's the translation layer:
-
-| CDISC concept | How it lives in R |
-|--------------|-------------------|
-| SDTM domain | A data frame with specific column names/types |
-| Controlled terminology | Character constants (`"Y"`, `"N"`) + codelists |
-| Variable attributes (label, length, type) | `haven::labelled` attributes |
-| SAS XPT format | Read/write via `haven`, export via `xportr` |
-| Define-XML / metadata spec | `metacore` objects |
-| Codelist | Named character vector or a `codelist` in metacore |
+*Last chapter we loaded DM and printed demographics. Now we look more carefully at what we have — and whether it's valid.*
 
 ---
 
-## The SDTM Domains You'll Work With
+## Where We Left Off
+
+```r
+# pharm001_ch01.R — what we have
+library(dplyr)
+library(pharmaversesdtm)
+
+dm          <- pharmaversesdtm::dm
+dm_enrolled <- dm %>% filter(ACTARM != "Screen Failure")
+# 254 enrolled subjects, basic age/sex summary printed
+```
+
+Chapter 2's job: understand the full SDTM domain structure, validate one variable against controlled terminology, and add a `validate_sdtm.R` file to the pipeline.
+
+---
+
+## The SDTM Domains for PHARM-001
 
 ```r
 library(pharmaversesdtm)
 
-# Core domains
-dm  <- pharmaversesdtm::dm   # Demographics
+dm  <- pharmaversesdtm::dm   # Demographics — one row per subject
 ae  <- pharmaversesdtm::ae   # Adverse Events
 ex  <- pharmaversesdtm::ex   # Exposure
 vs  <- pharmaversesdtm::vs   # Vital Signs
-lb  <- pharmaversesdtm::lb   # Laboratory
-cm  <- pharmaversesdtm::cm   # Concomitant Medications
 ds  <- pharmaversesdtm::ds   # Disposition
-mh  <- pharmaversesdtm::mh   # Medical History
-sc  <- pharmaversesdtm::sc   # Subject Characteristics
-sv  <- pharmaversesdtm::sv   # Subject Visits
+```
 
-# Look at DM structure
+The DM structure matters most — everything else joins back to it:
+
+```r
 glimpse(dm)
 ```
 
-Key things to notice in `dm`:
-
-```
-$ STUDYID  <chr> — study identifier
-$ DOMAIN   <chr> — always "DM"
-$ USUBJID  <chr> — unique subject identifier (STUDYID-SITEID-SUBJID)
-$ SUBJID   <chr> — subject identifier within site
-$ RFSTDTC  <chr> — reference start date/time (ISO8601)
-$ RFENDTC  <chr> — reference end date/time
-$ RFXSTDTC <chr> — exposure start
-$ RFXENDTC <chr> — exposure end
-$ RFICDTC  <chr> — informed consent date
-$ DTHDTC   <chr> — death date
-$ DTHFL    <chr> — death flag
-$ SITEID   <chr> — site
-$ AGE      <dbl> — age in AGEDGU units
-$ AGEU     <chr> — age units
-$ SEX      <chr> — sex (controlled terminology: M/F)
-$ RACE     <chr> — race (CT)
-$ ETHNIC   <chr> — ethnicity (CT)
-$ ARMCD    <chr> — planned arm code
-$ ARM      <chr> — planned arm description
-$ ACTARMCD <chr> — actual arm code
-$ ACTARM   <chr> — actual arm description
-```
+Key fields:
+- `USUBJID` — unique subject ID, format `STUDYID-SITEID-SUBJID`
+- `RFSTDTC` — reference start (ISO8601 character, e.g. `"2014-01-02"`)
+- `RFXSTDTC` — first exposure date/time (what we'll use for TRTSDT)
+- `RFXENDTC` — last exposure date/time (what we'll use for TRTEDT)
+- `SEX` — controlled terminology: `"M"` or `"F"`
+- `ACTARM` — actual treatment arm
 
 ---
 
 ## ISO8601 Dates
 
-SDTM uses ISO8601 character dates (`"2021-03-15"`, `"2021-03-15T09:30:00"`). You'll convert them to R Date/POSIXct for calculations.
+SDTM stores all dates as ISO8601 character strings. That means `RFSTDTC` is `"2014-01-02"`, not a Date object.
 
 ```r
-library(dplyr)
-library(lubridate)  # makes date arithmetic easy
+dm$RFSTDTC[1:3]
+# [1] "2014-01-02" "2014-01-11" "2013-08-28"
 
-dm_dates <- dm %>%
-  mutate(
-    # Convert ISO8601 to R Date
-    RFSTDT = as.Date(RFSTDTC),
-    RFENDT = as.Date(RFENDTC),
-    
-    # Calculate treatment duration (days)
-    TRTDUR = as.integer(RFENDT - RFSTDT + 1),
-    
-    # Partial dates: "2021-03" (day unknown) → keep as NA date
-    # Use admiral::convert_dtc_to_dt() for CDISC-compliant partial date handling
-  )
+class(dm$RFSTDTC)
+# [1] "character"
 ```
 
-**Admiral's approach** for ISO8601 partial dates:
+To do date arithmetic, convert:
 
 ```r
-library(admiral)
-
-# admiral provides derive_vars_dt() for proper ISO8601 handling
-# including imputation rules (first/last day of month, etc.)
-# See Chapter 5 for full usage
+as.Date(dm$RFSTDTC[1:3])
+# [1] "2014-01-02" "2014-01-11" "2013-08-28"
 ```
+
+Partial dates are the complication: `"2014-03"` has no day. `as.Date("2014-03")` returns `NA`. CDISC defines imputation rules for this — Chapter 4 handles it properly with `admiral::derive_vars_dt()`.
 
 ---
 
 ## Controlled Terminology
 
-CDISC controlled terminology (CT) values are just character constants in R. The discipline is applying them consistently.
+CDISC CT values are just character constants — the discipline is applying them consistently. PHARM-001 uses:
 
 ```r
-# Define your CT values as constants (or use a codelist)
-SEX_CT     <- c(F = "F", M = "M", U = "U")
-RACE_CT    <- c(
-  WHITE    = "WHITE",
-  BLACK    = "BLACK OR AFRICAN AMERICAN",
-  ASIAN    = "ASIAN",
-  OTHER    = "OTHER",
-  UNKNOWN  = "UNKNOWN"
-)
-YESNO_CT   <- c(Y = "Y", N = "N")
+# Sex: only M or F allowed
+unique(dm$SEX)
 
-# Validate
-ae %>%
-  filter(!AESER %in% c("Y", "N", NA)) %>%
-  nrow()   # should be 0
+# Treatment arms
+unique(dm$ACTARM)
+
+# AE seriousness: Y or N
+unique(ae$AESER)
+```
+
+Validate `SEX` — the simplest CT check:
+
+```r
+allowed_sex <- c("M", "F", "U", "UNDIFFERENTIATED")
+bad_sex <- dm %>% filter(!SEX %in% allowed_sex)
+nrow(bad_sex)   # should be 0
+```
+
+If it's not zero, you have a problem. In real data, you'd see things like `"Male"`, `"MALE"`, `"male"` — all wrong.
+
+---
+
+## The Naive Validation (and Why It's Not Enough)
+
+You might write:
+
+```r
+# This works, but it only prints — it doesn't fail loud
+if (any(!dm$SEX %in% c("M","F","U","UNDIFFERENTIATED"))) {
+  cat("Bad SEX values found\n")
+}
+```
+
+The problem: silent failures. If validation fails and the script keeps running, you get wrong output. We want loud failures:
+
+```r
+# This stops execution with a clear message
+stopifnot(
+  "SEX contains non-CT values" = all(dm$SEX %in% c("M","F","U","UNDIFFERENTIATED"))
+)
+```
+
+---
+
+## PHARM-001 Validation Program
+
+```r
+# pharm001_ch02_validate.R
+# Study PHARM-001 — Chapter 2
+# Validate SDTM domains before any ADaM derivation
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+ae <- pharmaversesdtm::ae
+ex <- pharmaversesdtm::ex
+
+cat("=== PHARM-001 SDTM Validation ===\n\n")
+
+# ---- Helper ----
+check <- function(label, condition) {
+  status <- if (condition) "[PASS]" else "[FAIL]"
+  cat(sprintf("%s %s\n", status, label))
+  invisible(condition)
+}
+
+# ---- DM checks ----
+check("DM: USUBJID is unique",
+      !any(duplicated(dm$USUBJID)))
+
+check("DM: SEX is controlled terminology",
+      all(dm$SEX %in% c("M", "F", "U", "UNDIFFERENTIATED")))
+
+check("DM: No missing STUDYID",
+      !any(is.na(dm$STUDYID)))
+
+check("DM: ACTARM populated",
+      !any(is.na(dm$ACTARM)))
+
+# Validate ISO8601 date format for RFSTDTC
+iso_pattern <- "^\\d{4}(-\\d{2}(-\\d{2})?)?$"
+rfstdtc_vals <- dm$RFSTDTC[!is.na(dm$RFSTDTC) & dm$RFSTDTC != ""]
+check("DM: RFSTDTC is ISO8601 format",
+      all(grepl(iso_pattern, rfstdtc_vals)))
+
+# ---- AE checks ----
+ae_subjects  <- unique(ae$USUBJID)
+dm_subjects  <- unique(dm$USUBJID)
+orphan_ae    <- setdiff(ae_subjects, dm_subjects)
+check(sprintf("AE: All subjects in DM (%d AE subjects, %d in DM)",
+              length(ae_subjects), length(dm_subjects)),
+      length(orphan_ae) == 0)
+
+check("AE: AESER is Y or N",
+      all(ae$AESER %in% c("Y", "N", NA)))
+
+check("AE: AESEQ is present",
+      "AESEQ" %in% names(ae))
+
+# ---- EX checks ----
+ex_subjects <- unique(ex$USUBJID)
+check("EX: All subjects in DM",
+      length(setdiff(ex_subjects, dm_subjects)) == 0)
+
+check("EX: EXDOSE is numeric",
+      is.numeric(ex$EXDOSE))
+
+# ---- Cross-domain: subjects with AE but no EX ----
+ae_no_ex <- setdiff(ae_subjects, ex_subjects)
+check(sprintf("Cross: AE subjects all have EX records (%d without EX)",
+              length(ae_no_ex)),
+      length(ae_no_ex) == 0)
+
+# ---- Summary ----
+cat("\nDomain sizes:\n")
+for (nm in c("dm","ae","ex","vs","ds")) {
+  df <- tryCatch(pharmaversesdtm::get(nm), error = function(e) NULL)
+  if (is.null(df)) df <- get(nm, envir = .GlobalEnv)
+  cat(sprintf("  %-5s: %d rows × %d cols\n", toupper(nm), nrow(df), ncol(df)))
+}
 ```
 
 ---
 
 ## Metadata with {metacore}
 
-In a real submission, your metadata lives in a spec (Excel or XML). `metacore` loads that spec into R so you can programmatically apply labels, types, lengths, and codelists.
+In a real submission, variable metadata (labels, types, lengths, codelists) comes from a spec spreadsheet. `metacore` loads that spec:
 
 ```r
 library(metacore)
 
-# Load from a spec (Excel format — see metacore vignette for format)
-spec <- spec_to_metacore("path/to/spec.xlsx", where_sep_sheet = FALSE)
+# Load from Excel spec (see metacore vignette for format)
+# spec <- spec_to_metacore("specs/ADaM_spec.xlsx", where_sep_sheet = FALSE)
 
-# Or build programmatically for demonstration:
-var_spec <- tibble::tribble(
-  ~dataset, ~variable, ~label,                            ~type,  ~length,
-  "ADSL",   "USUBJID", "Unique Subject Identifier",       "text",  200,
-  "ADSL",   "TRT01P",  "Planned Treatment for Period 01", "text",  200,
-  "ADSL",   "AGE",     "Age",                             "float",  8,
-  "ADSL",   "AGEU",    "Age Units",                       "text",   8,
-  "ADSL",   "SEX",     "Sex",                             "text",   2,
-  "ADSL",   "RACE",    "Race",                            "text",  200,
-)
+# What metacore gives you:
+# - Variable labels
+# - Type (text/float/integer)
+# - Length (for XPT)
+# - Codelists (for CT validation)
 ```
 
-We'll use `metacore` extensively in Chapter 5 (ADSL) and Chapter 9 (xportr).
+We'll use metacore in Chapter 9 when we export to XPT. For now, know it exists.
 
 ---
 
-## Program: Validate SDTM Domains
+## ADaM Structure Preview
 
+Every ADaM dataset joins back to ADSL. Know the pattern before we build it:
+
+| ADaM | Structure | Source SDTM |
+|------|-----------|-------------|
+| ADSL | One row per subject | DM + DS + EX |
+| ADAE | One row per AE occurrence | AE + ADSL |
+| ADTTE | One row per subject per event type | ADSL + AE/DS |
+
+The hierarchy is always: SDTM → ADSL → analysis datasets.
+
+---
+
+## What We Have Now
+
+```
+pharm001_ch01.R          [done] — load DM, count subjects, demographics summary
+pharm001_ch02_validate.R [done] — validate SDTM domains before ADaM work
+```
+
+Run validation first, then proceed:
 ```r
-# validate_sdtm.R
-# Check SDTM domains against common rules
-
-library(tidyverse)
-library(pharmaversesdtm)
-
-# ---- Load domains ----
-dm <- pharmaversesdtm::dm
-ae <- pharmaversesdtm::ae
-ex <- pharmaversesdtm::ex
-
-# ---- Validation functions ----
-
-# Check required variables exist
-check_required_vars <- function(df, domain, required) {
-  missing <- setdiff(required, names(df))
-  if (length(missing) > 0) {
-    cat(sprintf("[FAIL] %s: Missing required variables: %s\n",
-                domain, paste(missing, collapse=", ")))
-    return(FALSE)
-  }
-  cat(sprintf("[PASS] %s: All required variables present\n", domain))
-  TRUE
-}
-
-# Check USUBJID uniqueness (for DM)
-check_dm_uniqueness <- function(dm) {
-  dupes <- dm %>% count(USUBJID) %>% filter(n > 1)
-  if (nrow(dupes) > 0) {
-    cat(sprintf("[FAIL] DM: %d duplicate USUBJID(s)\n", nrow(dupes)))
-    return(FALSE)
-  }
-  cat("[PASS] DM: USUBJID is unique\n")
-  TRUE
-}
-
-# Check all AE subjects are in DM
-check_ae_in_dm <- function(ae, dm) {
-  ae_subjects <- unique(ae$USUBJID)
-  dm_subjects <- unique(dm$USUBJID)
-  orphans     <- setdiff(ae_subjects, dm_subjects)
-  if (length(orphans) > 0) {
-    cat(sprintf("[FAIL] AE: %d USUBJID(s) not in DM\n", length(orphans)))
-    return(FALSE)
-  }
-  cat("[PASS] AE: All subjects in DM\n")
-  TRUE
-}
-
-# Check ISO8601 date format
-check_dtc_format <- function(df, domain, dtc_vars) {
-  iso_pattern <- "^\\d{4}(-\\d{2}(-\\d{2}(T\\d{2}:\\d{2}(:\\d{2})?)?)?)?$"
-  for (var in dtc_vars) {
-    if (!var %in% names(df)) next
-    vals <- df[[var]][!is.na(df[[var]]) & df[[var]] != ""]
-    bad  <- vals[!grepl(iso_pattern, vals)]
-    if (length(bad) > 0) {
-      cat(sprintf("[FAIL] %s.%s: %d non-ISO8601 values: %s\n",
-                  domain, var, length(bad),
-                  paste(head(bad, 3), collapse=", ")))
-    } else {
-      cat(sprintf("[PASS] %s.%s: ISO8601 format OK\n", domain, var))
-    }
-  }
-}
-
-# Check controlled terminology
-check_ct <- function(df, domain, var, allowed_values) {
-  vals <- unique(df[[var]][!is.na(df[[var]])])
-  bad  <- setdiff(vals, allowed_values)
-  if (length(bad) > 0) {
-    cat(sprintf("[FAIL] %s.%s: Non-CT values: %s\n",
-                domain, var, paste(bad, collapse=", ")))
-    return(FALSE)
-  }
-  cat(sprintf("[PASS] %s.%s: Controlled terminology OK\n", domain, var))
-  TRUE
-}
-
-# ---- Run validations ----
-cat("=== SDTM Domain Validation ===\n\n")
-
-# DM
-check_required_vars(dm, "DM", c("STUDYID","DOMAIN","USUBJID","SUBJID",
-                                  "RFSTDTC","SEX","AGE","ACTARM"))
-check_dm_uniqueness(dm)
-check_dtc_format(dm, "DM", c("RFSTDTC", "RFENDTC", "RFICDTC"))
-check_ct(dm, "DM", "SEX", c("M","F","U","UNDIFFERENTIATED"))
-check_ct(dm, "DM", "ACTARM", unique(dm$ACTARM))  # at minimum not NA
-
-cat("\n")
-
-# AE
-check_required_vars(ae, "AE", c("STUDYID","DOMAIN","USUBJID","AESEQ",
-                                   "AETERM","AEDECOD","AEBODSYS",
-                                   "AESTDTC","AESER"))
-check_ae_in_dm(ae, dm)
-check_dtc_format(ae, "AE", c("AESTDTC","AEENDTC"))
-check_ct(ae, "AE", "AESER", c("Y","N"))
-check_ct(ae, "AE", "AEACN", c("DOSE NOT CHANGED","DRUG WITHDRAWN",
-                               "DOSE REDUCED","DOSE INCREASED",
-                               "NOT APPLICABLE","UNKNOWN","N/A",NA))
-
-cat("\n")
-
-# EX
-check_required_vars(ex, "EX", c("STUDYID","DOMAIN","USUBJID","EXSEQ",
-                                   "EXTRT","EXDOSE","EXDOSU",
-                                   "EXSTDTC","EXENDTC"))
-check_dtc_format(ex, "EX", c("EXSTDTC","EXENDTC"))
-
-cat("\n=== Validation complete ===\n")
+source("pharm001_ch02_validate.R")   # must all PASS
+source("pharm001_ch01.R")
 ```
-
----
-
-## ADaM Structure
-
-ADaM datasets in R are just data frames following the CDISC ADaM conventions. The key datasets you'll build:
-
-| ADaM | Contents | Key structure |
-|------|---------|---------------|
-| ADSL | Subject-level analysis | One row per subject |
-| ADAE | Adverse event analysis | One row per AE occurrence |
-| ADTTE | Time-to-event analysis | One row per subject per event type |
-| ADLB | Lab analysis | One row per subject per visit per parameter |
-| ADVS | Vital signs analysis | Same as ADLB pattern |
-| ADPC | PK concentrations | One row per sample |
 
 ---
 
 ## Exercises
 
-**1. Domain inspection**
+**1.** For `dm`, `ae`, `vs`, `ex`: list all `*DTC` variables (ISO8601 dates). Count how many rows have partial dates (missing day — pattern matches `^\d{4}-\d{2}$`).
 
-For each of `dm`, `ae`, `vs`, `ex` from `pharmaversesdtm`:
-- List all `*DTC` variables (ISO8601 dates)
-- Count how many have partial dates (missing day or month)
+**2.** Write `validate_ct(df, var, allowed)` that returns a data frame of violations: `USUBJID`, the bad value, and the variable name.
 
-**2. Controlled terminology check**
+**3.** Load `ds` (disposition). Map `DSDECOD` to a completion status: `"COMPLETED"`, `"WITHDRAWN"`, or `"OTHER"`.
 
-Write a function `validate_ct(df, domain, var, codelist)` that returns a tidy data frame of violations (USUBJID + bad value + variable name).
-
-**3. Subject disposition**
-
-Load `ds` (disposition domain). Map `DSDECOD` values to derive a "completion status" for each subject:
-- `"COMPLETED"` if DSDECOD = "COMPLETED"
-- `"WITHDRAWN"` if DSDECOD starts with "WITHDRAWAL"
-- `"OTHER"` otherwise
-
-**4. Cross-domain consistency**
-
-Check: every subject in `ae` has an exposure record in `ex`. Find subjects with AEs but no exposure.
+**4. (Sets up Chapter 3)** Look at `pharmaverseraw::dm_raw` (install `pharmaverseraw` if needed). Compare its `SEX`/`GENDER` column to `pharmaversesdtm::dm$SEX`. The raw data has values like `"Male"` and `"Female"`. The SDTM has `"M"` and `"F"`. What's the mapping rule? Write a function `map_sex(raw_val)` that does the conversion.
 
 ---
 
-*Next: Chapter 3 — SDTM with {sdtm.oak}: converting raw data to CDISC SDTM domains*
+*Next: Chapter 3 — we take raw data and use sdtm.oak to produce SDTM-compliant domains for PHARM-001.*

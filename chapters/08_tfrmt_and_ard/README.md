@@ -1,329 +1,257 @@
-# Chapter 8: ARDs and Formatting with {cards} and {tfrmt}
+# Chapter 8: Build the AE Table
 
-*Analysis Results Datasets, the emerging CDISC ARD standard, and publication-ready table formatting.*
-
----
-
-## What Are ARDs?
-
-An **Analysis Results Dataset (ARD)** separates the statistical computation from the table formatting. Instead of computing statistics and formatting them in the same step, you:
-
-1. Compute statistics → store as an ARD (a tidy data frame)
-2. Format the ARD → produce the final table
-
-This maps onto the CDISC Analysis Results Standard (ARS) that's gaining traction for regulatory submissions.
-
-```
-ADaM dataset → {cards} → ARD → {tfrmt} → Formatted Table
-```
-
-In practice, this lets you:
-- Reuse the same analysis results in multiple output formats (PDF, HTML, RTF, Word)
-- Share analysis results across collaborators/reviewers
-- Reproduce a table from just the ARD, without re-running the analysis
+*The demographics table is done. The AE table uses the same skeleton. We add it — and learn a cleaner approach for both.*
 
 ---
 
-## {cards} — Creating ARDs
+## Where We Left Off
+
+```
+pharm001_ch07_t14_1_1.R: Table 14.1.1 (demographics), KM plot
+output/t14_1_1.txt, output/f14_2_1_km_os.png
+```
+
+The SAP also requires Table 14.3.1: Treatment-Emergent Adverse Events by SOC and Preferred Term. The column structure is identical to the demographics table. We reuse the skeleton.
+
+---
+
+## Reuse the Column Layout
+
+Chapter 7's pattern:
+
+```r
+basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total")
+```
+
+The AE table uses this exactly. What changes: the row layout. Instead of `analyze_vars("AGE")`, we use `count_occurrences()` nested under `split_rows_by("AEBODSYS")`.
+
+---
+
+## The AE Table Layout
+
+```r
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae <- pharmaverseadam::adae %>%
+  filter(SAFFL == "Y", TRTEMFL == "Y")
+
+adsl_safe <- pharmaverseadam::adsl %>%
+  filter(SAFFL == "Y")
+
+# Column layout: same as demographics table
+lyt_ae <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  
+  # Any TEAE row
+  count_patients_with_flags(
+    var            = "USUBJID",
+    flag_variables = "TRTEMFL",
+    .labels        = c(TRTEMFL = "Any TEAE, n (%)")
+  ) %>%
+  
+  # Serious AEs row
+  count_patients_with_flags(
+    var            = "USUBJID",
+    flag_variables = "AESER",
+    .labels        = c(AESER = "Any Serious TEAE, n (%)")
+  ) %>%
+  
+  # Nested: SOC → PT within SOC
+  split_rows_by(
+    "AEBODSYS",
+    child_labels  = "visible",
+    nested        = FALSE,
+    label_pos     = "topleft"
+  ) %>%
+  count_occurrences(
+    vars          = "AEDECOD",
+    .indent_mods  = c(count_fraction = 1L)
+  )
+
+ae_table <- build_table(
+  lyt_ae,
+  df            = adae_teae,
+  alt_counts_df = adsl_safe    # denominators from full safety population
+)
+
+ae_table
+```
+
+The key detail: `alt_counts_df`. The denominator for percentages should be the safety population (N per arm), not the number of AE records. This is a common source of errors — without `alt_counts_df`, percentages would be wrong.
+
+---
+
+## Sort by Frequency
+
+Regulatory tables sort SOCs by descending subject count:
+
+```r
+ae_table_sorted <- ae_table %>%
+  sort_at_path(
+    path       = c("AEBODSYS"),
+    scorefun   = cont_n_allcols,
+    decreasing = TRUE
+  )
+```
+
+---
+
+## The Complete AE Program
+
+```r
+# pharm001_ch08_t14_3_1.R
+# Study PHARM-001 — Chapter 8
+# Table 14.3.1: Treatment-Emergent Adverse Events by SOC/PT
+# Safety Population
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae <- pharmaverseadam::adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+n_safety <- nrow(adsl_safe)
+cat(sprintf("Safety population: %d subjects\n", n_safety))
+cat(sprintf("TEAEs: %d events, %d subjects\n",
+            nrow(adae_teae), n_distinct(adae_teae$USUBJID)))
+
+lyt <- basic_table(
+  title          = "Table 14.3.1: Treatment-Emergent Adverse Events by SOC and Preferred Term",
+  subtitles      = "Safety Population",
+  show_colcounts = TRUE
+) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  
+  count_patients_with_flags(
+    "USUBJID",
+    flag_variables = c("TRTEMFL", "AESER"),
+    .labels = c(
+      TRTEMFL = "Subjects with any TEAE",
+      AESER   = "Subjects with any serious TEAE"
+    )
+  ) %>%
+  
+  split_rows_by("AEBODSYS", label_pos = "topleft", child_labels = "visible") %>%
+  count_occurrences("AEDECOD", .indent_mods = c(count_fraction = 1L))
+
+ae_tbl <- build_table(lyt, adae_teae, alt_counts_df = adsl_safe) %>%
+  sort_at_path(path = c("AEBODSYS"), scorefun = cont_n_allcols, decreasing = TRUE)
+
+print(ae_tbl)
+
+writeLines(export_as_txt(ae_tbl, lpp = 70), "output/t14_3_1.txt")
+cat("Saved: output/t14_3_1.txt\n")
+```
+
+---
+
+## ARDs: The Cleaner Approach
+
+The `rtables` approach computes statistics and formats them in one step. The ARD approach separates them:
+
+```
+ADaM → {cards} → ARD (statistics stored as tidy data) → {tfrmt} → formatted table
+```
+
+This matters when you need to reuse statistics across multiple outputs — e.g., the same age mean in both a table and a report.
 
 ```r
 library(cards)
 library(pharmaverseadam)
 library(dplyr)
 
-adsl <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
-```
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
 
-### Continuous summaries
-
-```r
+# Build ARD: one row per statistic per group
 ard_age <- ard_continuous(
-  data      = adsl,
+  data      = adsl_safe,
   variables = AGE,
   by        = TRT01A,
-  statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "p25", "p75",
-                                          "min", "max"))
+  statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
 )
 
-ard_age
-```
-
-Output: a tidy long-format ARD with one row per statistic per group:
-
-```
-  group1  group1_level variable stat_name  stat
-  <chr>   <chr>        <chr>    <chr>      <dbl>
-  TRT01A  Drug A       AGE      N           86
-  TRT01A  Drug A       AGE      mean        58.4
-  TRT01A  Drug A       AGE      sd          11.6
-  TRT01A  Drug A       AGE      median      60
-  ...
-```
-
-### Categorical summaries
-
-```r
 ard_sex <- ard_categorical(
-  data      = adsl,
+  data      = adsl_safe,
   variables = SEX,
   by        = TRT01A,
   statistic = ~ categorical_summary_fns(c("n", "p"))
 )
 
-# Combine multiple ARDs
+# Combine
 ard_demo <- bind_ard(ard_age, ard_sex)
+
+# Preview
+ard_demo %>%
+  filter(group1_level == "Drug A (N=134)", stat_name %in% c("mean","sd")) %>%
+  select(variable, stat_name, stat)
 ```
 
-### AE ARDs
-
-```r
-adae_teae <- pharmaverseadam::adae %>%
-  filter(SAFFL == "Y", TRTEMFL == "Y")
-
-ard_ae <- ard_categorical(
-  data      = adae_teae,
-  variables = AEDECOD,
-  by        = TRT01A
-)
-```
+The ARD is a tidy data frame — one row per statistic. You can inspect it, export it, pass it to `tfrmt` for formatting.
 
 ---
 
-## {tfrmt} — Table Formatting
+## gtsummary: The Quick Path
 
-`tfrmt` takes an ARD and a **table format specification** (a `tfrmt` object) and combines them into a publication-ready table. The format spec defines:
-
-- Which rows map to which statistics
-- How to display values (e.g., "mean (SD)", "n (%)")
-- Spanning headers
-- Column ordering
-- Footnotes
-
-```r
-library(tfrmt)
-
-# A simple tfrmt format spec
-fmt_demo <- tfrmt(
-  
-  # Column structure
-  group    = c(group1, group1_level),  # row grouping
-  label    = label,                    # row label
-  column   = column,                   # column variable (treatment arm)
-  param    = param,                    # statistic name
-  value    = value,                    # statistic value
-  
-  # Body plan: how to display each row type
-  body_plan = body_plan(
-    
-    # Continuous: "mean (SD)"
-    frmt_structure(
-      group_val = list(group1 = "AGE"),
-      label_val = ".default",
-      frmt_combine(
-        "{mean} ({sd})",
-        mean = frmt("xx.x"),
-        sd   = frmt("xx.x")
-      )
-    ),
-    
-    # Categorical: "n (%)"
-    frmt_structure(
-      group_val = list(group1 = "SEX"),
-      label_val = ".default",
-      frmt_combine(
-        "{n} ({p}%)",
-        n = frmt("xxx"),
-        p = frmt("xx.x")
-      )
-    )
-  ),
-  
-  # Column order
-  col_plan = col_plan(
-    "Drug A", "Drug B", "Placebo", "Total"
-  ),
-  
-  # Spanning header
-  col_style_plan = col_style_plan(
-    col_style_structure(
-      align = "center",
-      col   = c("Drug A","Drug B","Placebo")
-    )
-  )
-)
-```
-
----
-
-## Program: Demographics Table via ARD + tfrmt
-
-```r
-# ard_demo_table.R
-# Build demographics table using cards + tfrmt
-
-library(cards)
-library(tfrmt)
-library(pharmaverseadam)
-library(dplyr)
-library(tidyr)
-
-adsl      <- pharmaverseadam::adsl
-adsl_safe <- adsl %>% filter(SAFFL == "Y")
-
-# ---- 1. Build ARDs ----
-
-# Continuous
-ard_cont <- ard_continuous(
-  data      = adsl_safe,
-  variables = c(AGE, BMIBL),
-  by        = TRT01A,
-  statistic = ~ continuous_summary_fns(c("N","mean","sd","median","p25","p75","min","max"))
-)
-
-# Categorical
-ard_cat <- ard_categorical(
-  data      = adsl_safe,
-  variables = c(SEX, AGEGR1, RACE),
-  by        = TRT01A,
-  statistic = ~ categorical_summary_fns(c("n","p"))
-)
-
-# Overall column
-ard_cont_total <- ard_continuous(
-  data      = adsl_safe,
-  variables = c(AGE, BMIBL),
-  statistic = ~ continuous_summary_fns(c("N","mean","sd","median","p25","p75","min","max"))
-) %>% mutate(group1 = "TRT01A", group1_level = "Total")
-
-ard_cat_total <- ard_categorical(
-  data      = adsl_safe,
-  variables = c(SEX, AGEGR1, RACE),
-  statistic = ~ categorical_summary_fns(c("n","p"))
-) %>% mutate(group1 = "TRT01A", group1_level = "Total")
-
-# Bind all
-ard_full <- bind_ard(ard_cont, ard_cat, ard_cont_total, ard_cat_total)
-
-cat(sprintf("ARD rows: %d\n", nrow(ard_full)))
-cat(sprintf("ARD statistics: %s\n", paste(unique(ard_full$stat_name), collapse=", ")))
-
-# ---- 2. Preview ARD ----
-cat("\nARD sample (Age, Drug A):\n")
-ard_full %>%
-  filter(group1_level == "Drug A", variable == "AGE") %>%
-  select(group1_level, variable, stat_name, stat) %>%
-  print()
-
-# ---- 3. Summary statistics as a quick table ----
-cat("\n=== Demographics Summary (from ARD) ===\n")
-
-# Extract key stats and pivot
-arm_summary <- ard_full %>%
-  filter(stat_name %in% c("mean","sd","N")) %>%
-  select(group1_level, variable, stat_name, stat) %>%
-  pivot_wider(names_from = stat_name, values_from = stat) %>%
-  filter(!is.na(mean)) %>%
-  mutate(
-    display = sprintf("%.1f (%.1f)", mean, sd),
-    N       = as.integer(N)
-  )
-
-cat("\nMean (SD) by variable and treatment arm:\n")
-cat(sprintf("  %-12s  %-30s  %s\n", "Variable", "Arm", "Mean (SD)"))
-cat(strrep("-", 58), "\n")
-for (i in seq_len(nrow(arm_summary))) {
-  cat(sprintf("  %-12s  %-30s  %s  (n=%d)\n",
-              arm_summary$variable[i],
-              arm_summary$group1_level[i],
-              arm_summary$display[i],
-              arm_summary$N[i]))
-}
-```
-
----
-
-## {gtsummary} — The Simpler Path
-
-For standard tables where you don't need full ARD control, `gtsummary` is faster:
+For exploratory or non-regulatory tables, `gtsummary` takes 5 lines:
 
 ```r
 library(gtsummary)
 
-# Demographics table in 5 lines
 adsl_safe %>%
   select(AGE, SEX, RACE, AGEGR1, TRT01A) %>%
   tbl_summary(
-    by         = TRT01A,
-    statistic  = list(
+    by        = TRT01A,
+    statistic = list(
       all_continuous()  ~ "{mean} ({sd})",
       all_categorical() ~ "{n} ({p}%)"
-    ),
-    digits     = all_continuous() ~ 1
+    )
   ) %>%
   add_overall() %>%
-  add_p() %>%
   bold_labels()
 ```
 
-`gtsummary` produces beautiful HTML/Word/PDF tables with almost no code. The tradeoff: less control over exact regulatory formatting.
+Beautiful output, almost no code. Tradeoff: less control over exact regulatory formatting. Use `rtables` for submission tables, `gtsummary` for reports and slides.
 
 ---
 
-## RTF Output
+## What We Have Now
 
-For regulatory submissions, tables typically need RTF (Rich Text Format). Both `rtables` and `tfrmt` support this:
-
-```r
-# rtables → RTF (via formatR)
-library(rtables)
-library(formatR)   # or r2rtf
-
-tbl <- build_table(lyt, adsl_safe)
-# Use r2rtf for final RTF
-# r2rtf::write_rtf(tbl, "table_14_1_1.rtf")
-
-# tfrmt → GT → RTF (via officer/flextable)
-# tfrmt tables can be converted to gt objects, then saved
+```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM
+pharm001_ch03_dm.R       — map raw DM to SDTM
+pharm001_ch04.R          — derive TRTSDT, TRTEDT, TRTDURD
+pharm001_ch05_adsl.R     — complete ADSL
+pharm001_ch06_adae.R     — complete ADAE
+pharm001_ch07_t14_1_1.R  — Table 14.1.1 (demographics) + KM plot
+pharm001_ch08_t14_3_1.R  — Table 14.3.1 (TEAE by SOC/PT)
+output/
+  t14_1_1.txt
+  t14_3_1.txt
+  f14_2_1_km_os.png
 ```
 
 ---
 
 ## Exercises
 
-**1. Full ARD for AEs**
+**1.** The AE table currently shows all AEs. Add a filter for `AESEV == "SEVERE"` only, and produce a separate table of severe TEAEs. How does the column layout change? (It doesn't — same skeleton.)
 
-Build an ARD for AE incidence by PT and treatment arm. Include:
-- `n` (subjects with that PT)
-- `p` (proportion of safety population)
-- `N` (safety population denominator)
+**2.** Use `cards::ard_categorical()` to build an ARD for AE incidence by `AEDECOD` and `TRT01A`. Export it as a CSV. This is the beginning of an Analysis Results Dataset for the submission.
 
-**2. tfrmt AE table**
+**3.** The `alt_counts_df` argument is critical. To see why: run `build_table()` *without* `alt_counts_df`. What happens to the percentages? Are they correct? Why or why not?
 
-Using your AE ARD, define a `tfrmt` format spec that produces:
-```
-                   Drug A (N=86)  Drug B (N=93)  Placebo (N=86)
-SOC / Preferred Term
-  Eye disorders
-    Dry eye          3 (3.5%)      4 (4.3%)       2 (2.3%)
-```
-
-**3. gtsummary lab summary**
-
-Using `adlb` (filter to PARAMCD == "ALT", "AST", "BILI"), produce a gtsummary table of baseline lab values by treatment arm.
-
-**4. ARD to Excel**
-
-Write code to export an ARD to Excel with one sheet per variable:
-```r
-library(openxlsx)
-wb <- createWorkbook()
-for (var in unique(ard$variable)) {
-  addWorksheet(wb, var)
-  writeData(wb, var, ard %>% filter(variable == var))
-}
-saveWorkbook(wb, "ard_export.xlsx")
-```
+**4. (Sets up Chapter 9)** Try exporting your ADSL to XPT with just `haven::write_xpt(adsl, "adsl_naive.xpt")`. Then read it back with `haven::read_xpt("adsl_naive.xpt")`. Check: do variable labels survive the round trip? Do date columns have SAS date formats? Does the variable order match the ADaM spec? Note every problem you find — Chapter 9 fixes all of them.
 
 ---
 
-*Next: Chapter 9 — Submission Packages with {xportr}: export to XPT with full metadata*
+*Next: Chapter 9 — we export ADSL (and all ADaM) to XPT with full metadata. We'll fix every problem from the exercise above.*

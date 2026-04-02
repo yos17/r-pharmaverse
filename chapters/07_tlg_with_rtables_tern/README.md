@@ -1,44 +1,50 @@
-# Chapter 7: Tables, Listings & Graphs with {rtables} and {tern}
+# Chapter 7: Build the Demographics Table
 
-*Build clinical submission tables: demographics, AEs, lab summaries.*
+*The SAP requires Table 14.1.1: Summary of Demographic Characteristics. We have the ADSL. Let's build the table — one row at a time.*
 
 ---
 
-## The TLG Stack
+## Where We Left Off
 
-In SAS you use `PROC REPORT`, `PROC TABULATE`, and custom macros to produce tables. The pharmaverse equivalent:
+```
+pharm001_ch05_adsl.R: ADSL with AGE, AGEGR1, SEX, RACE, TRT01A, SAFFL
+```
 
-| Role | Package |
-|------|---------|
-| Table structure/layout | `rtables` |
-| Clinical analysis functions | `tern` |
+That's everything Table 14.1.1 needs. Now we learn `rtables` + `tern` to produce it.
+
+---
+
+## The SAS Mental Model
+
+In SAS, you'd use `PROC REPORT` or `PROC TABULATE`. In R, the pharmaverse approach:
+
+| SAS | R |
+|-----|---|
+| `PROC REPORT` | `rtables` (layout engine) |
+| Clinical analysis macros | `tern` (analysis functions) |
 | Listings | `rlistings` |
-| Summary tables (simpler) | `gtsummary` |
-| Graphs | `ggplot2`, `ggsurvfit`, `visR` |
+| Graphs | `ggplot2`, `ggsurvfit` |
+
+`rtables` separates **layout** (what the table looks like) from **analysis** (what statistics to compute). Build the layout, then `build_table()` fills it with data.
 
 ---
 
-## rtables Concepts
+## Start With One Row: Age
 
-`rtables` builds a table by defining a **layout** (the structure) and then **analyzing** data against it.
+Don't build the whole table first. Build one row. Make it work. Then add rows.
 
 ```r
 library(rtables)
 library(tern)
 library(pharmaverseadam)
+library(dplyr)
 
-adsl <- pharmaverseadam::adsl
-adsl_safe <- adsl %>% filter(SAFFL == "Y")
-```
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
 
-### Basic rtables
-
-```r
-# Simplest table: count by arm
-lyt <- basic_table() %>%
+# Simplest possible table: age statistics by treatment arm
+lyt <- basic_table(show_colcounts = TRUE) %>%
   split_cols_by("TRT01A") %>%
-  add_colcounts() %>%
-  count_values("SEX", values = "F", .labels = c(count_fraction = "Female, n (%)"))
+  analyze_vars("AGE", .stats = c("mean_sd"))
 
 tbl <- build_table(lyt, adsl_safe)
 tbl
@@ -46,135 +52,133 @@ tbl
 
 Output:
 ```
-                      Drug A (N=86)   Drug B (N=93)   Placebo (N=86)
-——————————————————————————————————————————————————————————————————
-Female, n (%)         43 (50%)        48 (51.6%)      42 (48.8%)
+                Drug A (N=134)  Drug B (N=134)  Placebo (N=134)
+AGE
+  Mean (SD)    58.7 (8.2)      55.6 (9.2)      57.9 (8.9)
+```
+
+One row. It works. Now add more statistics:
+
+```r
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  analyze_vars("AGE", .stats = c("n", "mean_sd", "median", "range"))
+
+tbl <- build_table(lyt, adsl_safe)
+tbl
 ```
 
 ---
 
-## Demographics Table (Table 14.1.1)
-
-The standard demographics table: continuous (mean/SD/median/range) and categorical (n/%) by treatment arm. This is the most common table you'll build.
+## Add a Total Column
 
 ```r
-library(rtables)
-library(tern)
-library(dplyr)
-library(pharmaverseadam)
-
-adsl      <- pharmaverseadam::adsl
-adsl_safe <- adsl %>% filter(SAFFL == "Y")
-
-# Analysis variables
-cat_vars  <- c("SEX", "AGEGR1", "RACE", "ETHNIC")
-cont_vars <- c("AGE", "BMIBL", "HEIGHTBL", "WEIGHTBL")
-
 lyt <- basic_table(show_colcounts = TRUE) %>%
-  
-  # Column split: one column per treatment arm + Total
   split_cols_by("TRT01A") %>%
   add_overall_col("Total") %>%
-  
-  # ---- Continuous variables ----
-  # Age: Mean (SD), Median, Range
-  analyze_vars(
-    vars    = "AGE",
-    .stats  = c("mean_sd", "median", "range"),
-    .labels = c(
-      mean_sd = "Mean (SD)",
-      median  = "Median",
-      range   = "Min, Max"
-    )
-  ) %>%
-  
-  # ---- Categorical: Sex ----
-  count_occurrences_by_grade(
-    var    = "SEX",
-    .stats = "count_fraction"
-  ) %>%
-  
-  # ---- Categorical: Age group ----
+  analyze_vars("AGE", .stats = c("n", "mean_sd", "median", "range"))
+```
+
+---
+
+## Add Age Group
+
+```r
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  analyze_vars("AGE", .stats = c("n", "mean_sd", "median", "range")) %>%
   count_occurrences_by_grade(
     var    = "AGEGR1",
     .stats = "count_fraction"
-  ) %>%
-  
-  # ---- Categorical: Race ----
-  count_occurrences_by_grade(
-    var    = "RACE",
-    .stats = "count_fraction"
   )
-
-demo_table <- build_table(lyt, adsl_safe)
-
-# Print
-demo_table
-
-# Export to text (for RTF output see Chapter 8)
-cat(export_as_txt(demo_table, lpp = 50))
 ```
 
 ---
 
-## AE Incidence Table
+## Add Sex and Race
 
-Standard AE table: subjects with at least one event, by SOC and PT, sorted by descending frequency.
+Keep adding rows:
 
 ```r
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  analyze_vars("AGE", .stats = c("n", "mean_sd", "median", "range"),
+               .labels = c(n="n", mean_sd="Mean (SD)",
+                           median="Median", range="Min, Max")) %>%
+  count_occurrences_by_grade("AGEGR1",
+    .labels = c(count_fraction="Age Group, n (%)")) %>%
+  count_occurrences_by_grade("SEX",
+    .labels = c(count_fraction="Sex, n (%)")) %>%
+  count_occurrences_by_grade("RACE",
+    .labels = c(count_fraction="Race, n (%)"))
+
+demo_table <- build_table(lyt, adsl_safe)
+demo_table
+```
+
+---
+
+## Table 14.1.1 Complete
+
+```r
+# pharm001_ch07_t14_1_1.R
+# Study PHARM-001 — Chapter 7
+# Table 14.1.1: Summary of Demographic Characteristics
+# Safety Population
+
 library(rtables)
 library(tern)
 library(pharmaverseadam)
+library(dplyr)
 
-adae  <- pharmaverseadam::adae
-adsl  <- pharmaverseadam::adsl
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
 
-# Safety population, treatment-emergent AEs only
-adae_safe <- adae %>%
-  filter(SAFFL == "Y", TRTEMFL == "Y")
+cat(sprintf("Safety population: %d subjects\n", nrow(adsl_safe)))
+cat(sprintf("Arms: %s\n", paste(sort(unique(adsl_safe$TRT01A)), collapse=", ")))
 
-# Full ADSL safety population (denominator)
-adsl_safe <- adsl %>% filter(SAFFL == "Y")
-
-# ---- AE table layout ----
-lyt_ae <- basic_table(show_colcounts = TRUE) %>%
+lyt <- basic_table(
+  title          = "Table 14.1.1: Summary of Demographic Characteristics",
+  subtitles      = "Safety Population",
+  show_colcounts = TRUE
+) %>%
   split_cols_by("TRT01A") %>%
   add_overall_col("Total") %>%
   
-  # Overall any AE row
-  count_patients_with_flags(
-    var    = "USUBJID",
-    flag_variables = "TRTEMFL",
-    .labels = c(TRTEMFL = "Any TEAE")
+  # Age — continuous
+  analyze_vars(
+    "AGE",
+    .stats  = c("n", "mean_sd", "median", "range", "quantiles"),
+    .labels = c(n="n", mean_sd="Mean (SD)", median="Median",
+                range="Min, Max", quantiles="Q1, Q3")
   ) %>%
   
-  # Serious AEs row
-  count_patients_with_flags(
-    var            = "USUBJID",
-    flag_variables = "AESER",
-    .labels        = c(AESER = "Any Serious TEAE")
+  # Age group — categorical
+  count_occurrences_by_grade(
+    "AGEGR1",
+    .labels = c(count_fraction="n (%)")
   ) %>%
   
-  # By SOC, then PT within SOC
-  split_rows_by(
-    "AEBODSYS",
-    child_labels = "visible",
-    nested       = FALSE,
-    label_pos    = "topleft"
+  # Sex
+  count_occurrences_by_grade(
+    "SEX",
+    .labels = c(count_fraction="n (%)")
   ) %>%
   
-  count_occurrences(
-    vars       = "AEDECOD",
-    .indent_mods = c(count_fraction = 1L)
+  # Race
+  count_occurrences_by_grade(
+    "RACE",
+    .labels = c(count_fraction="n (%)")
   )
 
-ae_table <- build_table(
-  lyt_ae,
-  df     = adae_safe,
-  alt_counts_df = adsl_safe   # use full ADSL for denominators
-)
+demo_table <- build_table(lyt, adsl_safe)
+print(demo_table)
 
-ae_table
+# Export to text
+out_txt <- export_as_txt(demo_table, lpp = 60)
+writeLines(out_txt, "output/t14_1_1.txt")
+cat("\nSaved: output/t14_1_1.txt\n")
 ```
 
 ---
@@ -187,44 +191,39 @@ Listings are simpler — no statistics, just formatted rows:
 library(rlistings)
 library(pharmaverseadam)
 
-adae_safe <- pharmaverseadam::adae %>%
+adae_serious <- pharmaverseadam::adae %>%
   filter(SAFFL == "Y", AESER == "Y") %>%
   select(USUBJID, AEDECOD, AEBODSYS, AESEV, AESTDTC, AEENDTC, AEOUT) %>%
   arrange(USUBJID, AESTDTC)
 
 lst <- as_listing(
-  adae_safe,
+  adae_serious,
   key_cols   = c("USUBJID", "AEBODSYS"),
   disp_cols  = c("AEDECOD", "AESEV", "AESTDTC", "AEENDTC", "AEOUT"),
   main_title = "Listing of Serious Adverse Events",
-  subtitles  = c("Safety Population", "Treatment-Emergent"),
-  main_footer = "Note: Sorted by USUBJID and AE start date."
+  subtitles  = "Safety Population — Treatment-Emergent"
 )
 
-lst
-cat(export_as_txt(lst, lpp = 60))
+print(lst)
 ```
 
 ---
 
-## Graphs: KM Curve
+## KM Plot
+
+The SAP requires a Kaplan-Meier plot (Figure 14.2.1). Use `ggsurvfit`:
 
 ```r
 library(ggsurvfit)
 library(survival)
+library(pharmaverseadam)
 library(dplyr)
 
-adtte <- pharmaverseadam::adtte
-
-# Overall survival
-os_data <- adtte %>%
+os_data <- pharmaverseadam::adtte %>%
   filter(PARAMCD == "OS") %>%
-  mutate(
-    AVAL_MONTHS = AVAL / 30.4375,   # days to months
-    ARM = factor(TRT01A)
-  )
+  mutate(AVAL_MONTHS = AVAL / 30.4375)
 
-km_fit <- survfit(Surv(AVAL_MONTHS, 1 - CNSR) ~ ARM, data = os_data)
+km_fit <- survfit(Surv(AVAL_MONTHS, 1 - CNSR) ~ TRT01A, data = os_data)
 
 ggsurvfit(km_fit, linewidth = 1) +
   add_confidence_interval() +
@@ -235,109 +234,42 @@ ggsurvfit(km_fit, linewidth = 1) +
     title    = "Figure 14.2.1: Kaplan-Meier Plot of Overall Survival",
     subtitle = "Intent-to-Treat Population",
     x        = "Time (Months)",
-    y        = "Overall Survival Probability"
+    y        = "Probability"
   ) +
   theme_classic()
+
+ggsave("output/f14_2_1_km_os.png", width = 10, height = 7)
 ```
 
 ---
 
-## Program: Complete TLG Suite
+## What We Have Now
 
-```r
-# tlg_suite.R
-# Produce Table 14.1.1 (demographics), Table 14.3.1 (AE overview),
-# and Figure 14.2.1 (OS KM) as text output
-
-library(rtables)
-library(tern)
-library(rlistings)
-library(ggsurvfit)
-library(survival)
-library(pharmaverseadam)
-library(dplyr)
-
-adsl  <- pharmaverseadam::adsl
-adae  <- pharmaverseadam::adae
-adtte <- pharmaverseadam::adtte
-
-# Populations
-adsl_safe <- adsl %>% filter(SAFFL == "Y")
-adae_teae <- adae %>% filter(SAFFL=="Y", TRTEMFL=="Y")
-
-# ---- Table 14.1.1: Demographics ----
-cat("\n", strrep("=", 60), "\n")
-cat("TABLE 14.1.1 — SUMMARY OF DEMOGRAPHIC CHARACTERISTICS\n")
-cat("SAFETY POPULATION\n")
-cat(strrep("=", 60), "\n")
-
-lyt_demo <- basic_table(show_colcounts = TRUE) %>%
-  split_cols_by("TRT01A") %>%
-  add_overall_col("Total") %>%
-  analyze_vars("AGE", .stats = c("n","mean_sd","median","range")) %>%
-  count_occurrences_by_grade("SEX") %>%
-  count_occurrences_by_grade("AGEGR1") %>%
-  count_occurrences_by_grade("RACE")
-
-build_table(lyt_demo, adsl_safe) %>% print()
-
-# ---- Table 14.3.1: AE Summary ----
-cat("\n", strrep("=", 60), "\n")
-cat("TABLE 14.3.1 — OVERVIEW OF ADVERSE EVENTS\n")
-cat("SAFETY POPULATION\n")
-cat(strrep("=", 60), "\n")
-
-lyt_ae_overview <- basic_table(show_colcounts = TRUE) %>%
-  split_cols_by("TRT01A") %>%
-  add_overall_col("Total") %>%
-  count_patients_with_flags(
-    "USUBJID",
-    flag_variables = c("TRTEMFL","AESER"),
-    .labels = c(
-      TRTEMFL = "Subjects with any TEAE",
-      AESER   = "Subjects with any Serious TEAE"
-    )
-  )
-
-build_table(lyt_ae_overview, adae_teae, alt_counts_df = adsl_safe) %>% print()
-
-# ---- AE by PT ----
-cat("\n--- By System Organ Class and Preferred Term ---\n")
-
-lyt_ae_pt <- basic_table(show_colcounts = TRUE) %>%
-  split_cols_by("TRT01A") %>%
-  split_rows_by("AEBODSYS", label_pos = "topleft") %>%
-  count_occurrences("AEDECOD")
-
-build_table(lyt_ae_pt, adae_teae, alt_counts_df = adsl_safe) %>%
-  sort_at_path(
-    path     = c("AEBODSYS"),
-    scorefun = cont_n_allcols,
-    decreasing = TRUE
-  ) %>%
-  print()
+```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM
+pharm001_ch03_dm.R       — map raw DM to SDTM
+pharm001_ch04.R          — derive TRTSDT, TRTEDT, TRTDURD
+pharm001_ch05_adsl.R     — complete ADSL
+pharm001_ch06_adae.R     — complete ADAE
+pharm001_ch07_t14_1_1.R  — Table 14.1.1 (demographics) + KM plot
+output/
+  t14_1_1.txt
+  f14_2_1_km_os.png
 ```
 
 ---
 
 ## Exercises
 
-**1. p-values in demographics**
+**1.** Add p-values to the demographics table. Use `test_summary_vector()` from `tern` for continuous variables and chi-square for categorical.
 
-Add p-values to the demographics table using `tern::test_summary_vector`. Use chi-square for categorical and t-test/ANOVA for continuous variables.
+**2.** Produce a simple listing of all screen failures from `dm`: `USUBJID`, `SITEID`, `RFICDTC`, `ACTARM` — sorted by `SITEID` then `USUBJID`.
 
-**2. Forest plot**
+**3.** The `rtables` function `sort_at_path()` sorts rows by frequency. Add it to the race rows in Table 14.1.1 so that the most common race appears first.
 
-Using `tern::g_forest()` or `ggplot2`, produce a forest plot of odds ratios for any AE by subgroup (SEX, AGEGR1, RACE).
-
-**3. Lab shift table**
-
-Using `adlb` (lab analysis dataset), produce a shift table: baseline NCI CTCAE grade (rows) × worst post-baseline grade (columns), for each treatment arm.
-
-**4. Volcano plot**
-
-For the AE data: produce a volcano plot where x = risk difference (Drug vs Placebo) and y = -log10(p-value from Fisher's exact test). Use `ggplot2`.
+**4. (Sets up Chapter 8)** The AE table (Table 14.3.1) has the same column structure as the demographics table: arms as columns, a Total column. The pattern is identical: `split_cols_by("TRT01A") %>% add_overall_col("Total")`. But the rows are different — AE counts by SOC and PT, not continuous statistics. Sketch the `rtables` layout for the AE table: what functions would you use for the rows? Look at `count_occurrences()` in the `tern` documentation.
 
 ---
 
-*Next: Chapter 8 — ARDs and Formatting with {cards} and {tfrmt}*
+*Next: Chapter 8 — we reuse the demographics table skeleton to build the AE table.*

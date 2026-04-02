@@ -1,208 +1,202 @@
-# Chapter 3: SDTM with {sdtm.oak}
+# Chapter 3: Map Raw Data to SDTM
 
-*Map raw collected data to CDISC SDTM using an algorithm-based approach.*
+*Last chapter we validated the SDTM. Now we understand where it came from — and build it.*
 
 ---
 
-## What sdtm.oak Does
+## Where We Left Off
 
-In SAS, you map raw data to SDTM with manual `DATA` steps and format statements. `sdtm.oak` provides a declarative, algorithm-based approach: you define *how* to assign each SDTM variable, and the package handles the mechanics.
-
-```r
-library(sdtm.oak)
-library(pharmaverseraw)  # example raw datasets
-library(dplyr)
-library(lubridate)
 ```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM domains
+```
+
+In the real world, SDTM doesn't arrive pre-built. It gets programmed from raw CRF data. This chapter adds a SDTM mapping program to PHARM-001.
+
+The task: take `pharmaverseraw::dm_raw` and produce a CDISC-compliant DM domain. Start with two variables — `DOMAIN` and `SEX` — then build the full mapping.
 
 ---
 
 ## The Raw Data
 
-`pharmaverseraw` provides realistic raw CRF datasets:
-
 ```r
-# Raw adverse events
-raw_ae <- pharmaverseraw::ae_raw
-glimpse(raw_ae)
+library(pharmaverseraw)
 
-# Raw demographics
 raw_dm <- pharmaverseraw::dm_raw
 glimpse(raw_dm)
 ```
 
-Raw data looks like what comes out of EDC (Electronic Data Capture) — messy column names, no controlled terminology, dates in various formats.
+Raw data looks like what comes out of EDC — messy column names, non-CT values, dates in various formats. Key raw columns and their SDTM targets:
+
+| Raw column | SDTM variable | Transformation needed |
+|-----------|--------------|----------------------|
+| `SUBJID` | `SUBJID` | direct |
+| `GENDER` | `SEX` | `"Male"` → `"M"`, `"Female"` → `"F"` |
+| `RFICDTC` | `RFICDTC` | date format conversion |
+| — | `DOMAIN` | hard-coded `"DM"` |
+| — | `USUBJID` | concatenate STUDYID + SITEID + SUBJID |
 
 ---
 
-## The Algorithm Concept
+## The Naive Approach (and Why It Breaks)
 
-`sdtm.oak` uses "algorithms" — named transformations that move raw variables to SDTM variables. Each algorithm is a function that assigns a value based on a rule.
+You might write:
 
-The core algorithms:
+```r
+dm_naive <- raw_dm %>%
+  mutate(
+    DOMAIN  = "DM",
+    SEX     = case_when(
+      GENDER == "Male"   ~ "M",
+      GENDER == "Female" ~ "F",
+      TRUE               ~ NA_character_
+    )
+  )
+```
+
+This works for this dataset. But what about the next study where raw values are `"MALE"`, `"male"`, `"1"`, `"2"`? And the study after that? You'd rewrite the `case_when` every time, and every programmer would write a slightly different version.
+
+This is the problem `sdtm.oak` solves.
+
+---
+
+## What sdtm.oak Does
+
+`sdtm.oak` provides **algorithm functions** — named transformations that move raw variables to SDTM variables according to CDISC rules. The algorithms:
 
 | Algorithm | What it does |
 |-----------|-------------|
-| `assign_ct()` | Assign from controlled terminology codelist |
-| `assign_no_ct()` | Assign value directly (no CT lookup) |
-| `assign_datetime()` | Convert to ISO8601 datetime |
-| `hardcode_ct()` | Hard-code a CT value (e.g., DOMAIN = "AE") |
-| `hardcode_no_ct()` | Hard-code a non-CT value |
-| `combine_dtc()` | Combine date + time into ISO8601 |
+| `hardcode_no_ct()` | Hard-code a value (e.g., DOMAIN = "DM") |
+| `hardcode_ct()` | Hard-code a CT value |
+| `assign_no_ct()` | Copy raw variable directly |
+| `assign_ct()` | Map raw value to CT using a codelist |
+| `assign_datetime()` | Convert to ISO8601 |
+
+The key insight: CT mapping uses CDISC NCI codelist C-codes, not hand-coded `case_when`. This makes mappings reproducible across studies.
 
 ---
 
-## Building a DM Domain
+## Step 1: DOMAIN
+
+Start simple. `DOMAIN` is always hard-coded:
 
 ```r
-# dm_mapping.R
-# Map raw DM to SDTM DM using sdtm.oak
-
 library(sdtm.oak)
 library(pharmaverseraw)
 library(dplyr)
 
-# Load raw data
 raw_dm <- pharmaverseraw::dm_raw
 
-# Load the CDISC controlled terminology codelist
-# (sdtm.oak ships with a built-in CT object)
-ct <- sdtm.oak::ct_spec_example("ct-01-prog")
-
-# --- Start the mapping ---
+# oak_id_vars() identifies each raw record — by default STUDYID + USUBJID + raw sequence
 dm <- raw_dm %>%
-  
-  # Fixed domain variables
-  hardcode_no_ct(oak_id_vars   = oak_id_vars(),
-                 raw_dat       = raw_dm,
-                 raw_var       = "DOMAIN",
-                 tgt_var       = "DOMAIN",
-                 tgt_val       = "DM") %>%
-  
-  # USUBJID — concatenate STUDYID + SITEID + SUBJID
-  assign_no_ct(oak_id_vars = oak_id_vars(),
-               raw_dat     = raw_dm,
-               raw_var     = "SUBJID",
-               tgt_var     = "USUBJID",
-               .fn         = function(x) paste(x$STUDYID, x$SITEID, x, sep="-")) %>%
-  
-  # AGE — direct assignment (numeric)
-  assign_no_ct(oak_id_vars = oak_id_vars(),
-               raw_dat     = raw_dm,
-               raw_var     = "AGE",
-               tgt_var     = "AGE") %>%
-  
-  # SEX — CT assignment (maps raw "Male"/"Female" to "M"/"F")
-  assign_ct(oak_id_vars = oak_id_vars(),
-            raw_dat     = raw_dm,
-            raw_var     = "GENDER",
-            tgt_var     = "SEX",
-            ct_spec     = ct,
-            ct_clst     = "C66731") %>%   # C66731 = Sex codelist in NCI CT
-  
-  # RACE — CT
-  assign_ct(oak_id_vars = oak_id_vars(),
-            raw_dat     = raw_dm,
-            raw_var     = "RACE",
-            tgt_var     = "RACE",
-            ct_spec     = ct,
-            ct_clst     = "C74457") %>%
-  
-  # RFSTDTC — ISO8601 conversion
-  assign_datetime(oak_id_vars = oak_id_vars(),
-                  raw_dat     = raw_dm,
-                  raw_var     = "RFICDTC",
-                  tgt_var     = "RFICDTC",
-                  raw_fmt     = "d-m-y") %>%
-  
-  # Select SDTM variables in correct order
-  select(STUDYID, DOMAIN, USUBJID, SUBJID, SITEID,
-         RFICDTC, RFSTDTC, RFENDTC,
-         DTHDTC, DTHFL,
-         AGE, AGEU, SEX, RACE, ETHNIC,
-         ARMCD, ARM, ACTARMCD, ACTARM)
+  hardcode_no_ct(
+    oak_id_vars = oak_id_vars(),
+    raw_dat     = raw_dm,
+    raw_var     = "DOMAIN",
+    tgt_var     = "DOMAIN",
+    tgt_val     = "DM"
+  )
+
+table(dm$DOMAIN)   # should be all "DM"
 ```
 
 ---
 
-## Building an AE Domain
+## Step 2: SEX with CT Mapping
 
-AE is more complex — it has repeat records per subject, start/end dates, severity grades, seriousness flags.
+Now the interesting part. Load the CT spec and use `assign_ct()`:
 
 ```r
-# ae_mapping.R
+ct <- sdtm.oak::ct_spec_example("ct-01-prog")
+
+dm <- dm %>%
+  assign_ct(
+    oak_id_vars = oak_id_vars(),
+    raw_dat     = raw_dm,
+    raw_var     = "GENDER",    # raw column
+    tgt_var     = "SEX",       # SDTM target
+    ct_spec     = ct,
+    ct_clst     = "C66731"     # NCI codelist: Sex (M/F/U/UNDIFFERENTIATED)
+  )
+
+table(raw_dm$GENDER, dm$SEX, useNA = "always")
+```
+
+The codelist `C66731` maps `"Male"` → `"M"`, `"Female"` → `"F"`, etc. Any raw value not in the codelist maps to `NA` — which surfaces as a problem, not a silent wrong value.
+
+---
+
+## The Full DM Mapping
+
+```r
+# pharm001_ch03_dm.R
+# Study PHARM-001 — Chapter 3
+# Map raw DM to SDTM DM using sdtm.oak
 
 library(sdtm.oak)
 library(pharmaverseraw)
+library(pharmaversesdtm)
 library(dplyr)
 
-raw_ae <- pharmaverseraw::ae_raw
+raw_dm <- pharmaverseraw::dm_raw
 ct     <- sdtm.oak::ct_spec_example("ct-01-prog")
 
-ae <- raw_ae %>%
+cat("=== PHARM-001 DM Mapping ===\n")
+cat(sprintf("Raw rows: %d\n", nrow(raw_dm)))
+
+dm <- raw_dm %>%
   
-  # DOMAIN
+  # Fixed domain
   hardcode_no_ct(oak_id_vars = oak_id_vars(),
-                 raw_dat     = raw_ae,
-                 raw_var     = "DOMAIN",
-                 tgt_var     = "DOMAIN",
-                 tgt_val     = "AE") %>%
+                 raw_dat = raw_dm,
+                 raw_var = "DOMAIN",
+                 tgt_var = "DOMAIN",
+                 tgt_val = "DM") %>%
   
-  # AETERM — verbatim term (no CT)
+  # USUBJID: concatenate
   assign_no_ct(oak_id_vars = oak_id_vars(),
-               raw_dat     = raw_ae,
-               raw_var     = "AETERM",
-               tgt_var     = "AETERM") %>%
+               raw_dat     = raw_dm,
+               raw_var     = "SUBJID",
+               tgt_var     = "USUBJID",
+               .fn         = function(x) paste(x$STUDYID, x$SITEID, x, sep = "-")) %>%
   
-  # AEDECOD — MedDRA preferred term (comes from coding)
+  # Demographics — direct copy
   assign_no_ct(oak_id_vars = oak_id_vars(),
-               raw_dat     = raw_ae,
-               raw_var     = "MEDDRA_PT",
-               tgt_var     = "AEDECOD") %>%
+               raw_dat = raw_dm, raw_var = "AGE",    tgt_var = "AGE") %>%
   
-  # AEBODSYS — MedDRA SOC
   assign_no_ct(oak_id_vars = oak_id_vars(),
-               raw_dat     = raw_ae,
-               raw_var     = "MEDDRA_SOC",
-               tgt_var     = "AEBODSYS") %>%
+               raw_dat = raw_dm, raw_var = "AGEU",   tgt_var = "AGEU") %>%
   
-  # AESER — seriousness (Y/N CT)
+  # Sex — CT mapping
   assign_ct(oak_id_vars = oak_id_vars(),
-            raw_dat     = raw_ae,
-            raw_var     = "SERIOUS",
-            tgt_var     = "AESER",
-            ct_spec     = ct,
-            ct_clst     = "C66742") %>%   # No/Yes
+            raw_dat = raw_dm, raw_var = "GENDER", tgt_var = "SEX",
+            ct_spec = ct, ct_clst = "C66731") %>%
   
-  # AESEV — severity (MILD/MODERATE/SEVERE)
+  # Race — CT mapping
   assign_ct(oak_id_vars = oak_id_vars(),
-            raw_dat     = raw_ae,
-            raw_var     = "SEVERITY",
-            tgt_var     = "AESEV",
-            ct_spec     = ct,
-            ct_clst     = "C41338") %>%   # Severity
+            raw_dat = raw_dm, raw_var = "RACE",   tgt_var = "RACE",
+            ct_spec = ct, ct_clst = "C74457") %>%
   
-  # AESTDTC — start date/time
+  # Dates — ISO8601 conversion
   assign_datetime(oak_id_vars = oak_id_vars(),
-                  raw_dat     = raw_ae,
-                  raw_var     = "AESTDTC",
-                  tgt_var     = "AESTDTC",
-                  raw_fmt     = "d-m-y") %>%
+                  raw_dat = raw_dm, raw_var = "RFICDTC",
+                  tgt_var = "RFICDTC", raw_fmt = "d-m-y") %>%
   
-  # AEENDTC — end date
-  assign_datetime(oak_id_vars = oak_id_vars(),
-                  raw_dat     = raw_ae,
-                  raw_var     = "AEENDTC",
-                  tgt_var     = "AEENDTC",
-                  raw_fmt     = "d-m-y") %>%
-  
-  # AESEQ — sequence number (derive after all records are built)
-  group_by(USUBJID) %>%
-  mutate(AESEQ = row_number()) %>%
-  ungroup() %>%
-  
-  select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AEDECOD, AEBODSYS,
-         AESEV, AESER, AEACN, AESTDTC, AEENDTC, AEOUT, AETOXGR)
+  # Select SDTM variables
+  select(STUDYID, DOMAIN, USUBJID, SUBJID, SITEID,
+         RFICDTC, RFSTDTC, RFENDTC, RFXSTDTC, RFXENDTC,
+         DTHDTC, DTHFL, AGE, AGEU, SEX, RACE, ETHNIC,
+         ARMCD, ARM, ACTARMCD, ACTARM)
+
+cat(sprintf("Mapped rows: %d\n", nrow(dm)))
+
+# Verify against reference SDTM
+ref_dm <- pharmaversesdtm::dm
+cat(sprintf("\nReference SDTM rows: %d\n", nrow(ref_dm)))
+
+# CT check
+cat("\nSEX mapping check:\n")
+print(table(raw_dm$GENDER, dm$SEX, useNA = "always"))
 ```
 
 ---
@@ -211,20 +205,22 @@ ae <- raw_ae %>%
 
 ### oak_id_vars()
 
-Every `sdtm.oak` function takes `oak_id_vars()` — these are the variables that uniquely identify a record in the raw data. By default: `STUDYID`, `USUBJID`, and the raw record sequence variable.
+Every function takes `oak_id_vars()` — the variables that uniquely identify a raw record. Defaults to `STUDYID` + `USUBJID` + the raw record sequence variable. Change it if your raw data has a different structure.
+
+### Failed CT Mappings Produce NA
+
+If a raw value has no match in the codelist, `assign_ct()` produces `NA`. This is intentional — it surfaces unmapped values as missing rather than wrong.
 
 ```r
-# Default oak_id_vars — usually fine for standard mappings
-oak_id_vars()  
+# Find values that didn't map
+dm %>% filter(is.na(SEX)) %>% select(USUBJID) %>%
+  left_join(raw_dm %>% select(USUBJID, GENDER), by = "USUBJID")
+# Shows: USUBJID + the raw GENDER value that failed
 ```
 
-### Algorithms Are Composable
+### NCI CT Codelist C-codes
 
-You chain them with `%>%`. Each step adds a variable to the dataset. Failed mappings (no matching CT value, missing raw) produce `NA`.
-
-### CT Codes
-
-CDISC NCI thesaurus codelists have C-codes. The most common ones:
+The most common ones:
 
 | Codelist | C-code | Contents |
 |----------|--------|---------|
@@ -233,80 +229,52 @@ CDISC NCI thesaurus codelists have C-codes. The most common ones:
 | Severity | C41338 | MILD, MODERATE, SEVERE |
 | Race | C74457 | WHITE, BLACK OR AFRICAN AMERICAN, etc. |
 | Route | C66729 | ORAL, INTRAVENOUS, etc. |
-| Action Taken | C66767 | DOSE NOT CHANGED, etc. |
 
 ---
 
-## Program: SDTM Mapping Report
+## Mapping Report: Raw vs. SDTM
 
 ```r
-# sdtm_report.R
-# Map raw data and produce a comparison report
+# Compare your mapping against reference
+cat("\n=== Mapping Comparison vs Reference ===\n")
 
-library(sdtm.oak)
-library(pharmaverseraw)
-library(pharmaversesdtm)   # reference SDTM
-library(dplyr)
+# Variables added by mapping (not in raw, present in SDTM)
+added <- setdiff(names(ref_dm), names(raw_dm))
+cat("Added by mapping:", paste(added, collapse = ", "), "\n")
 
-raw_dm <- pharmaverseraw::dm_raw
-ref_dm <- pharmaversesdtm::dm    # what it should look like
+# Subject count
+cat(sprintf("Raw subjects:  %d\n", n_distinct(raw_dm$USUBJID)))
+cat(sprintf("Mapped:        %d\n", n_distinct(dm$USUBJID)))
+cat(sprintf("Reference:     %d\n", n_distinct(ref_dm$USUBJID)))
 
-cat("=== Raw DM vs SDTM DM ===\n\n")
+# Date format
+cat("\nDate format check (RFICDTC, first 3):\n")
+cat("  Raw:  ", paste(head(raw_dm$RFICDTC, 3), collapse=", "), "\n")
+cat("  Mapped:", paste(head(dm$RFICDTC, 3), collapse=", "), "\n")
+```
 
-# Compare column coverage
-raw_vars <- names(raw_dm)
-sdtm_vars <- names(ref_dm)
-added     <- setdiff(sdtm_vars, raw_vars)  # derived in mapping
-dropped   <- setdiff(raw_vars, sdtm_vars)  # raw-only, not in SDTM
+---
 
-cat("Variables added by mapping:\n")
-for (v in added) cat(sprintf("  + %s\n", v))
+## What We Have Now
 
-cat("\nRaw variables not carried to SDTM:\n")
-for (v in dropped) cat(sprintf("  - %s\n", v))
-
-# Compare subject counts
-cat(sprintf("\nRaw subjects:  %d\n", n_distinct(raw_dm$USUBJID)))
-cat(sprintf("SDTM subjects: %d\n", n_distinct(ref_dm$USUBJID)))
-
-# Date format comparison
-cat("\nDate format check (first 3 RFSTDTC values):\n")
-cat("  Raw:  ", paste(head(raw_dm$RFSTDTC, 3), collapse=", "), "\n")
-cat("  SDTM: ", paste(head(ref_dm$RFSTDTC, 3), collapse=", "), "\n")
-
-# Sex CT mapping
-raw_sex  <- table(raw_dm$SEX)
-sdtm_sex <- table(ref_dm$SEX)
-cat("\nSex mapping:\n")
-cat("  Raw: "); print(raw_sex)
-cat("  SDTM:"); print(sdtm_sex)
+```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM domains
+pharm001_ch03_dm.R       — map raw DM to SDTM using sdtm.oak
 ```
 
 ---
 
 ## Exercises
 
-**1. Map VS domain**
+**1.** The raw AE data is in `pharmaverseraw::ae_raw`. Map `AETERM`, `AESER` (use CT C66742), and `AESTDTC`. What percentage of `AESER` values fail CT mapping?
 
-Load `pharmaverseraw::vs_raw`. Map it to SDTM VS including:
-- `VSTESTCD` / `VSTEST` (test code and name)
-- `VSORRES` / `VSSTRESC` (original result and standardized)
-- `VSORRESU` / `VSSTRESU` (original and standard units)
-- `VSSTDTC` (date/time)
-- `VISITNUM` / `VISIT`
+**2.** Add `AESEQ` as a sequence number within each `USUBJID`, ordered by `AESTDTC`.
 
-**2. Sequence numbers**
+**3.** Write `impute_date(dtc, rule)` where `rule = "first"` fills a partial date `"2014-03"` as `"2014-03-01"`, and `rule = "last"` fills it as `"2014-03-31"`.
 
-Add `VSSEQ` as a sequence number within each USUBJID, ordered by `VSTESTCD` then `VSSTDTC`.
-
-**3. Date imputation**
-
-Some SDTM dates are partial — the day is missing. Write a function `impute_date(dtc, rule)` where `rule = "first"` fills day=01 and `rule = "last"` fills the last day of the month.
-
-**4. CT validation**
-
-After mapping, check that all `AESER` values are in `c("Y", "N")`. How would you flag rows that couldn't be mapped?
+**4. (Sets up Chapter 4)** In `pharmaversesdtm::dm`, find subjects where `RFXSTDTC` is not `NA`. Convert `RFXSTDTC` to a Date. Now find subjects where `RFXSTDTC` is missing — what's their `ACTARM`? This tells you why the derivation of `TRTSDT` in the next chapter needs special handling.
 
 ---
 
-*Next: Chapter 4 — ADaM with {admiral}: the core package for building analysis datasets*
+*Next: Chapter 4 — we use admiral to derive TRTSDT and TRTEDT from the SDTM we now understand.*

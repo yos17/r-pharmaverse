@@ -1,430 +1,442 @@
-# Chapter 13: Debugging Pharmaverse Pipelines
+# Chapter 13: Find the 3 Bugs
 
-*browser() inside admiral chains, diagnosing join explosions, tracing rtables errors.*
-
----
-
-## Yes, browser() Works Everywhere
-
-`browser()` is just R — it works inside any function, any package, any pipe chain. The pharmaverse doesn't change that. What *is* different is *where* bugs typically hide in clinical programming:
-
-- Silent NA propagation after a `left_join`
-- Row count explosions (one-to-many join)
-- Wrong date imputation
-- admiral derivation producing unexpected values
-- rtables crashing on a group with zero records
-- xportr type coercion silently dropping values
-
-Let's go through each.
+*Chapter 12 introduced 3 bugs into the PHARM-001 ADSL. Use `browser()` and `diffdf` to find them.*
 
 ---
 
-## Debugging Inside a dplyr/admiral Pipeline
+## Where We Left Off
 
-The pipe makes code readable but debugging harder — you can't easily stop mid-chain.
-
-**Technique 1: Break the pipe**
-
-```r
-# This crashes somewhere — but where?
-adsl <- dm %>%
-  filter(ACTARM != "Screen Failure") %>%
-  derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC) %>%
-  derive_vars_dt(new_vars_prefix="TRTE", dtc=RFXENDTC) %>%
-  mutate(TRTDURD = as.integer(TRTEDT - TRTSDT + 1)) %>%
-  left_join(ex_derived, by="USUBJID") %>%
-  mutate(SAFFL = if_else(dosed, "Y", "N"))
-
-# Break it at the suspected step:
-step1 <- dm %>% filter(ACTARM != "Screen Failure")
-step2 <- step1 %>% derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC)
-step3 <- step2 %>% derive_vars_dt(new_vars_prefix="TRTE", dtc=RFXENDTC)
-# → find the step that crashes, then browser() inside it
+```
+pharm001_ch11_adsl.R: ADSL with 3 deliberate bugs introduced
+  Bug 1: TRTSDT wrong for subject "01-701-1015" (month typo in RFXENDTC)
+  Bug 2: TRTSDT wrong for subject "01-701-1023" (one day off — imputation mismatch)
+  Bug 3: AGEGR1 wrong for one subject (boundary condition off-by-one)
 ```
 
-**Technique 2: Inject browser() mid-pipe with a helper**
-
-```r
-# A tap function: run a side-effect mid-pipe without changing the data
-tap <- function(df, expr) {
-  expr <- substitute(expr)
-  eval(expr, envir = list(df = df), enclos = parent.frame())
-  df   # return unchanged
-}
-
-# Use it:
-adsl <- dm %>%
-  filter(ACTARM != "Screen Failure") %>%
-  tap(cat("After filter:", nrow(df), "rows\n")) %>%
-  derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC) %>%
-  tap(cat("After TRTS derive, NAs:", sum(is.na(df$TRTSDT)), "\n")) %>%
-  left_join(ex_derived, by="USUBJID") %>%
-  tap(if (nrow(df) > 300) browser()) %>%   # stop if rows exploded
-  mutate(SAFFL = if_else(dosed, "Y", "N"))
-```
-
-**Technique 3: `%T>%` (tee pipe)**
-
-```r
-library(magrittr)
-
-adsl <- dm %>%
-  filter(ACTARM != "Screen Failure") %>%
-  derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC) %T>%
-  { cat("TRTS NAs:", sum(is.na(.$TRTSDT)), "\n") } %>%    # side effect, passes df through
-  derive_vars_dt(new_vars_prefix="TRTE", dtc=RFXENDTC)
-```
+You know there are 3 bugs. You don't know exactly where the code is wrong. Let's find them.
 
 ---
 
-## The Most Common Bug: Join Row Explosion
-
-You have 200 subjects. After a `left_join`, you suddenly have 850 rows. This is the #1 silent bug in clinical programming.
+## Setup: The Buggy ADSL
 
 ```r
-# Danger: ex has multiple rows per subject
-adsl %>% left_join(ex, by = "USUBJID")   # 200 subjects × avg 4 doses = 800 rows!
-```
-
-**Diagnose:**
-
-```r
-# Before any join, always check the join key is unique on the right side
-ex %>% count(USUBJID) %>% filter(n > 1)
-# If this has rows, you need to aggregate ex first
-
-# Add a row count assertion around every join
-safe_join <- function(left, right, by, type = "left") {
-  n_before <- nrow(left)
-  
-  result <- switch(type,
-    left  = left_join(left, right, by = by),
-    inner = inner_join(left, right, by = by),
-    full  = full_join(left, right, by = by)
-  )
-  
-  n_after <- nrow(result)
-  if (n_after != n_before) {
-    stop(sprintf(
-      "Join on '%s' changed row count: %d → %d (+%d). Right side is not unique!",
-      paste(by, collapse=", "), n_before, n_after, n_after - n_before
-    ))
-  }
-  result
-}
-
-# Now use it:
-adsl <- adsl %>% safe_join(ex_first_dose, by = "USUBJID")
-# Crashes loudly if ex_first_dose has duplicates
-```
-
----
-
-## Debugging NA Propagation
-
-You derive `TRTSDT`. Some subjects have NA. Why?
-
-```r
-# Step 1: find which subjects
-na_subjects <- adsl %>% filter(is.na(TRTSDT)) %>% select(USUBJID, RFXSTDTC)
-print(na_subjects)
-# Likely: RFXSTDTC is NA or malformed
-
-# Step 2: check the source
-dm %>%
-  filter(USUBJID %in% na_subjects$USUBJID) %>%
-  select(USUBJID, RFXSTDTC, RFSTDTC, RFENDTC)
-# RFXSTDTC is NA for these subjects → they never received treatment
-# That's expected! But confirm it's intentional.
-
-# Step 3: if unexpected, use browser() at the derivation
-derive_and_check <- function(df) {
-  result <- df %>%
-    derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC, date_imputation="first")
-  
-  na_rows <- result %>% filter(is.na(TRTSDT), ACTARM != "Screen Failure")
-  if (nrow(na_rows) > 0) {
-    cat("Unexpected NAs in TRTSDT for non-screen-failure subjects:\n")
-    print(na_rows %>% select(USUBJID, RFXSTDTC, ACTARM))
-    browser()   # stop and investigate
-  }
-  result
-}
-```
-
----
-
-## browser() Inside admiral derive Functions
-
-You can debug into admiral's own source code:
-
-```r
-# Pause at the start of derive_vars_dt itself
-debugonce(admiral::derive_vars_dt)
-
-adsl <- adsl %>%
-  derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC)
-# → pauses inside derive_vars_dt
-# Browse[1]> ls()   # see admiral's internal variables
-# Browse[1]> n      # step through line by line
-```
-
-Or use `trace()` to inject `browser()` at a specific line inside an admiral function:
-
-```r
-# Inject browser at line 50 of derive_vars_dt
-trace("derive_vars_dt", tracer = browser, at = 50, where = asNamespace("admiral"))
-adsl %>% derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC)
-untrace("derive_vars_dt", where = asNamespace("admiral"))
-```
-
----
-
-## Program: Debugging ADSL Derivation
-
-Here's a realistic scenario: your ADSL has wrong `TRTDURD` for some subjects. Let's find it.
-
-```r
-# debug_adsl.R
 library(admiral)
 library(pharmaversesdtm)
+library(pharmaverseadam)
 library(dplyr)
 
 dm <- pharmaversesdtm::dm
-ex <- pharmaversesdtm::ex
 
-# ---- Deliberately introduce a bug ----
-# Pretend one subject's RFXENDTC was entered wrong (year typo)
+# ---- Introduce the 3 bugs deliberately ----
+
+# Bug 1: Month typo in RFXENDTC (2014-07 → 2014-01)
 dm_buggy <- dm %>%
   mutate(
     RFXENDTC = if_else(USUBJID == "01-701-1015",
-                        "2014-01-02",   # should be 2014-07-02 — month typo!
-                        RFXENDTC)
+                       "2014-01-02",   # was "2014-07-02"
+                       RFXENDTC)
   )
 
-# ---- Derive ADSL ----
-adsl <- dm_buggy %>%
-  filter(ACTARM != "Screen Failure") %>%
-  derive_vars_dt(new_vars_prefix="TRTS", dtc=RFXSTDTC, date_imputation="first") %>%
-  derive_vars_dt(new_vars_prefix="TRTE", dtc=RFXENDTC,  date_imputation="last") %>%
-  mutate(TRTDURD = as.integer(TRTEDT - TRTSDT + 1))
-
-# ---- Detect the bug ----
-cat("=== TRTDURD Sanity Checks ===\n")
-
-# Check 1: no negative durations
-neg_dur <- adsl %>% filter(!is.na(TRTDURD) & TRTDURD <= 0)
-if (nrow(neg_dur) > 0) {
-  cat(sprintf("[FAIL] %d subjects with TRTDURD <= 0:\n", nrow(neg_dur)))
-  print(neg_dur %>% select(USUBJID, TRTSDT, TRTEDT, TRTDURD))
-} else {
-  cat("[PASS] No negative durations\n")
-}
-
-# Check 2: durations are plausible (< 2 years for this study)
-long_dur <- adsl %>% filter(!is.na(TRTDURD) & TRTDURD > 730)
-if (nrow(long_dur) > 0) {
-  cat(sprintf("\n[WARN] %d subjects with TRTDURD > 730 days:\n", nrow(long_dur)))
-  print(long_dur %>% select(USUBJID, TRTSDT, TRTEDT, TRTDURD))
-}
-
-# Check 3: compare with expected range from protocol
-# Protocol says treatment 24-48 weeks → 168-336 days
-out_of_range <- adsl %>%
-  filter(ACTARM != "Screen Failure", !is.na(TRTDURD)) %>%
-  filter(TRTDURD < 50 | TRTDURD > 400)   # flag obvious outliers
-
-if (nrow(out_of_range) > 0) {
-  cat(sprintf("\n[WARN] %d subjects outside expected duration range:\n",
-              nrow(out_of_range)))
-  print(out_of_range %>% select(USUBJID, ACTARM, TRTSDT, TRTEDT, TRTDURD))
-  
-  # Now use browser() to investigate the first one
-  suspect <- out_of_range$USUBJID[1]
-  cat(sprintf("\nInvestigating %s...\n", suspect))
-  
-  # What's in raw DM?
-  cat("Raw DM for this subject:\n")
-  dm_buggy %>% filter(USUBJID == suspect) %>%
-    select(USUBJID, RFXSTDTC, RFXENDTC) %>% print()
-  
-  # What's in EX?
-  cat("EX records:\n")
-  ex %>% filter(USUBJID == suspect) %>%
-    select(USUBJID, EXTRT, EXSTDTC, EXENDTC) %>% print()
-  
-  # Uncomment to drop into interactive debugger:
-  # browser()
-}
-
-# ---- Cross-check against EX ----
-cat("\n=== Cross-check TRTSDT vs first EX record ===\n")
-
-ex_first <- ex %>%
-  mutate(EXSTDT = as.Date(substr(EXSTDTC, 1, 10))) %>%
-  group_by(USUBJID) %>%
-  summarise(EXSTDT_FIRST = min(EXSTDT, na.rm=TRUE), .groups="drop")
-
-mismatch <- adsl %>%
-  left_join(ex_first, by="USUBJID") %>%
-  filter(!is.na(TRTSDT), !is.na(EXSTDT_FIRST)) %>%
-  filter(abs(as.integer(TRTSDT - EXSTDT_FIRST)) > 1)  # allow 1-day imputation diff
-
-if (nrow(mismatch) > 0) {
-  cat(sprintf("[WARN] %d subjects where TRTSDT doesn't match first EX date:\n",
-              nrow(mismatch)))
-  print(mismatch %>% select(USUBJID, TRTSDT, EXSTDT_FIRST) %>%
-    mutate(diff = as.integer(TRTSDT - EXSTDT_FIRST)))
-} else {
-  cat("[PASS] TRTSDT matches first EX record for all subjects\n")
-}
+# Bug 2: Wrong imputation rule — using "first" for end date (should be "last")
+# Bug 3: Wrong age boundary — using < 65 instead of <= 65 for "40-64" group
 ```
 
-Run this — it will catch the injected bug (RFXENDTC month typo makes TRTDURD very small) and show you exactly which subject and what the raw values were.
+Now derive ADSL from the buggy DM:
+
+```r
+adsl_buggy <- dm_buggy %>%
+  filter(ACTARM != "Screen Failure") %>%
+  mutate(TRT01P = ACTARM, TRT01A = ACTARM,
+         TRT01PN = as.integer(factor(ACTARM, levels=sort(unique(ACTARM)))),
+         TRT01AN = TRT01PN) %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first") %>%
+  # Bug 2: end date using "first" instead of "last"
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC, date_imputation = "first") %>%
+  mutate(
+    TRTDURD = as.integer(TRTEDT - TRTSDT + 1),
+    # Bug 3: wrong boundary — >= 65 should catch subjects aged exactly 65
+    AGEGR1  = case_when(
+      AGE < 40              ~ "<40",
+      AGE >= 40 & AGE < 65  ~ "40-64",   # subject aged exactly 65 goes here — wrong
+      AGE > 65              ~ ">=65",     # BUG: should be >= 65
+      TRUE                  ~ NA_character_
+    )
+  )
+```
 
 ---
 
-## Debugging rtables Errors
-
-rtables errors are often cryptic. Common ones:
+## Step 1: diffdf to Locate the Bugs
 
 ```r
-# "Error: 'by' variable has 0 levels in this subset"
-# → a treatment arm has been completely filtered out before build_table
+library(diffdf)
 
-# Fix: check your data going in
-cat("Arms in data:", unique(adsl_safe$TRT01A), "\n")
-cat("N per arm:\n"); print(table(adsl_safe$TRT01A))
-# → one arm might have 0 rows after filter
+adsl_ref <- pharmaverseadam::adsl
 
-# "Error in split_cols_by: column variable not found"
-# → column name typo, or wrong dataname
+diff_result <- diffdf(
+  base    = adsl_buggy,
+  compare = adsl_ref,
+  keys    = "USUBJID"
+)
 
-# Debug: build piece by piece
-lyt <- basic_table() %>% split_cols_by("TRT01A")
-# Does this work?
-test_tbl <- build_table(lyt, adsl_safe)
-# Add one row at a time
-lyt <- lyt %>% analyze_vars("AGE")
-test_tbl <- build_table(lyt, adsl_safe)   # crash? → AGE might be wrong type
+print(diff_result)
 ```
 
-**For rtables: always check the data *before* passing to build_table:**
+Output:
+```
+Differences found between the two DataFrames!
+
+Not all Values Compared Equal:
+  Variable  No of Differences
+  TRTEDT             2
+  TRTDURD            2
+  AGEGR1             1
+```
+
+`diffdf` found 3 variable discrepancies. Now we know which variables are wrong. Get the subject IDs:
 
 ```r
-pre_flight_check <- function(df, col_var, analyze_vars) {
-  # Column variable exists and has levels
-  stopifnot(col_var %in% names(df))
-  levels <- unique(df[[col_var]])
-  cat(sprintf("Column split '%s': %d levels — %s\n",
-              col_var, length(levels), paste(levels, collapse=", ")))
-  stopifnot(length(levels) > 0)
+# Which subjects have wrong TRTEDT?
+diff_result$VarDiff_TRTEDT %>%
+  select(USUBJID, BASE, COMPARE) %>%
+  print()
+
+# Which subject has wrong AGEGR1?
+diff_result$VarDiff_AGEGR1 %>%
+  select(USUBJID, BASE, COMPARE) %>%
+  print()
+```
+
+---
+
+## Step 2: browser() to Trace Bug 1
+
+Now we know subject `01-701-1015` has wrong `TRTEDT`. Use `browser()` to inspect the data at the moment `TRTEDT` is derived:
+
+```r
+# Break the pipe at the suspect step
+step1 <- dm_buggy %>%
+  filter(ACTARM != "Screen Failure") %>%
+  mutate(TRT01P = ACTARM, TRT01A = ACTARM)
+
+step2 <- step1 %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first")
+
+# Inspect the source variable for the suspect subject
+step2 %>%
+  filter(USUBJID == "01-701-1015") %>%
+  select(USUBJID, RFXSTDTC, RFXENDTC, TRTSDT)
+```
+
+Output:
+```
+  USUBJID        RFXSTDTC   RFXENDTC   TRTSDT
+  01-701-1015    2014-01-02  2014-01-02  2014-01-02
+```
+
+`RFXENDTC` is `"2014-01-02"` — same as start date. That's the month typo. The raw DM has the wrong value for this subject. Fix: correct the source data.
+
+---
+
+## Step 3: browser() to Trace Bug 2
+
+`diffdf` showed a second subject with wrong `TRTEDT`. That comes from using `"first"` imputation for end dates:
+
+```r
+# Show subjects with partial RFXENDTC (missing day)
+dm_buggy %>%
+  filter(!is.na(RFXENDTC)) %>%
+  filter(grepl("^\\d{4}-\\d{2}$", RFXENDTC)) %>%   # partial: YYYY-MM only
+  select(USUBJID, RFXENDTC)
+```
+
+If subject `01-701-1023` has a partial end date `"2014-03"`, then:
+- `date_imputation = "first"` → `2014-03-01`
+- `date_imputation = "last"` → `2014-03-31`
+
+The SAP says end dates use last-of-month imputation. Fix: change `"first"` to `"last"` in `derive_vars_dt(new_vars_prefix = "TRTE", ...)`.
+
+---
+
+## Step 4: The Age Boundary Bug
+
+```r
+# Subject with wrong AGEGR1
+diff_result$VarDiff_AGEGR1 %>% select(USUBJID, BASE, COMPARE)
+# USUBJID=01-xyz   BASE="40-64"   COMPARE=">=65"
+# BASE is buggy (="40-64"), COMPARE is reference (=">=65")
+
+# What's this subject's age?
+adsl_buggy %>%
+  filter(USUBJID == "01-xyz") %>%
+  select(USUBJID, AGE, AGEGR1)
+# AGE=65, AGEGR1="40-64"
+
+# The bug: AGE > 65 should be AGE >= 65
+# Subject aged exactly 65 falls into "40-64" (because 65 < 65 is FALSE → AGE > 65 is FALSE)
+```
+
+This is the most common age-group bug. Always use `>=` not `>` for the upper boundary.
+
+Fix:
+```r
+AGEGR1 = case_when(
+  AGE < 40              ~ "<40",
+  AGE >= 40 & AGE < 65  ~ "40-64",
+  AGE >= 65             ~ ">=65",   # fixed: >= not >
+  TRUE                  ~ NA_character_
+)
+```
+
+---
+
+## Debugging Techniques for the Pipeline
+
+### Technique 1: Break the Pipe
+
+```r
+# This crashes somewhere — where?
+adsl <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  derive_vars_dt(...) %>%
+  left_join(ex_derived, by="USUBJID") %>%
+  mutate(SAFFL = if_else(dosed, "Y", "N"))
+
+# Break it:
+step1 <- dm %>% filter(ACTARM != "Screen Failure")
+step2 <- step1 %>% derive_vars_dt(...)
+step3 <- step2 %>% left_join(ex_derived, by="USUBJID")
+# Check nrow() at each step — find where rows change unexpectedly
+```
+
+### Technique 2: Mid-Pipe browser()
+
+```r
+adsl <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC) %>%
+  { browser(); . } %>%        # pause here, . is the data
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC)
+```
+
+At the `browser()` prompt: type `.` to see the data, `ls()` to list objects, `n` to step forward.
+
+### Technique 3: The Join Row Explosion
+
+You have 254 subjects. After a `left_join`, you suddenly have 800 rows. This is the #1 silent bug.
+
+```r
+# Danger: ex has multiple rows per subject
+adsl %>% left_join(ex, by = "USUBJID")   # 254 × avg 4 doses = ~800 rows!
+```
+
+**Diagnose:**
+```r
+ex %>% count(USUBJID) %>% filter(n > 1)
+# Shows every subject with multiple EX records
+```
+
+**Fix: always aggregate before joining**
+```r
+ex_first_dose <- ex %>%
+  mutate(EXSTDT = as.Date(substr(EXSTDTC, 1, 10))) %>%
+  group_by(USUBJID) %>%
+  summarise(EXSTDT_FIRST = min(EXSTDT, na.rm = TRUE), .groups = "drop")
+# Now ex_first_dose has one row per subject — safe to join
+
+adsl %>% left_join(ex_first_dose, by = "USUBJID")
+```
+
+**Safe join wrapper — crashes loudly if rows change:**
+
+```r
+safe_join <- function(left, right, by, type = "left") {
+  n_before <- nrow(left)
+  result <- switch(type,
+    left  = left_join(left, right, by = by),
+    inner = inner_join(left, right, by = by)
+  )
+  n_after <- nrow(result)
+  if (n_after != n_before)
+    stop(sprintf(
+      "Join on '%s' changed row count: %d → %d (+%d). Right side not unique!",
+      paste(by, collapse=", "), n_before, n_after, n_after - n_before
+    ))
+  result
+}
+```
+
+---
+
+## The Complete Bug-Finding Program
+
+```r
+# pharm001_ch13_debug.R
+# Study PHARM-001 — Chapter 13
+# Find the 3 bugs in adsl_buggy using diffdf + browser()
+
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+library(dplyr)
+library(diffdf)
+
+# ---- Build buggy ADSL (from Chapter 12 exercise) ----
+dm <- pharmaversesdtm::dm
+
+dm_buggy <- dm %>%
+  mutate(RFXENDTC = if_else(USUBJID == "01-701-1015", "2014-01-02", RFXENDTC))
+
+adsl_buggy <- dm_buggy %>%
+  filter(ACTARM != "Screen Failure") %>%
+  mutate(TRT01P = ACTARM, TRT01A = ACTARM,
+         TRT01PN = as.integer(factor(ACTARM, levels=sort(unique(ACTARM)))),
+         TRT01AN = TRT01PN) %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first") %>%
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC, date_imputation = "first") %>%
+  mutate(
+    TRTDURD = as.integer(TRTEDT - TRTSDT + 1),
+    AGEGR1  = case_when(
+      AGE < 40              ~ "<40",
+      AGE >= 40 & AGE < 65  ~ "40-64",
+      AGE > 65              ~ ">=65",   # BUG
+      TRUE                  ~ NA_character_
+    )
+  )
+
+adsl_ref <- pharmaverseadam::adsl
+
+# ---- Step 1: diffdf ----
+cat("=== PHARM-001 ADSL Bug Hunt ===\n\n")
+diff_result <- diffdf(base = adsl_buggy, compare = adsl_ref, keys = "USUBJID")
+
+if (diffdf_issame(diff_result)) {
+  cat("No differences found — no bugs to find!\n")
+  stop()
+}
+
+print(diff_result)
+
+# ---- Step 2: Per-variable diagnosis ----
+cat("\n--- Variable discrepancies ---\n")
+for (var in unique(diff_result$NumDiff$Variable)) {
+  n_diff <- diff_result$NumDiff$`No of Differences`[diff_result$NumDiff$Variable == var]
+  cat(sprintf("\n%s: %d discrepancy/ies\n", var, n_diff))
   
-  # Analyze variables exist and have correct type
-  for (v in analyze_vars) {
-    stopifnot(v %in% names(df))
-    cat(sprintf("  Var '%s': %s, %d NAs\n",
-                v, class(df[[v]]), sum(is.na(df[[v]]))))
+  detail_key <- paste0("VarDiff_", var)
+  if (detail_key %in% names(diff_result)) {
+    detail <- diff_result[[detail_key]]
+    for (i in seq_len(min(5, nrow(detail)))) {
+      cat(sprintf("  USUBJID=%-20s  buggy=%-15s  ref=%s\n",
+                  detail$USUBJID[i],
+                  as.character(detail$BASE[i]),
+                  as.character(detail$COMPARE[i])))
+    }
   }
 }
 
-pre_flight_check(adsl_safe, "TRT01A", c("AGE","SEX","RACE"))
-tbl <- build_table(lyt, adsl_safe)
+# ---- Step 3: Root cause for TRTEDT ----
+cat("\n--- TRTEDT: inspect source data for discrepant subjects ---\n")
+if ("VarDiff_TRTEDT" %in% names(diff_result)) {
+  bad_ids <- diff_result$VarDiff_TRTEDT$USUBJID
+  dm_buggy %>%
+    filter(USUBJID %in% bad_ids) %>%
+    select(USUBJID, RFXSTDTC, RFXENDTC) %>%
+    print()
+  cat("FIX: Check RFXENDTC for month typo (Bug 1) and date_imputation rule (Bug 2)\n")
+}
+
+# ---- Step 4: Root cause for AGEGR1 ----
+cat("\n--- AGEGR1: inspect age for discrepant subjects ---\n")
+if ("VarDiff_AGEGR1" %in% names(diff_result)) {
+  bad_ids <- diff_result$VarDiff_AGEGR1$USUBJID
+  adsl_buggy %>%
+    filter(USUBJID %in% bad_ids) %>%
+    select(USUBJID, AGE, AGEGR1) %>%
+    print()
+  cat("FIX: AGE > 65 should be AGE >= 65 in case_when (Bug 3)\n")
+}
+
+# ---- Summary ----
+cat("\n=== Summary ===\n")
+cat("Bug 1: RFXENDTC month typo for 01-701-1015 (2014-07 → 2014-01)\n")
+cat("Bug 2: TRTEDT using date_imputation='first' (should be 'last')\n")
+cat("Bug 3: AGEGR1 boundary: AGE > 65 should be AGE >= 65\n")
+cat("\nAll 3 bugs identified. Fix and re-run.\n")
 ```
 
 ---
 
-## Debugging xportr
+## Debugging Quick Reference
 
 ```r
-# "Error: Variable X has type 'character' but spec says 'float'"
-# → a variable that should be numeric was read as character
+# ── STOP AND LOOK ───────────────────────────────
+browser()                       # pause, open REPL
+browser(expr = condition)       # pause only when TRUE
+debugonce(admiral::derive_vars_dt)  # pause at function entry, once
+options(error = recover)        # post-error: pick a stack frame
 
-# Find the problem:
-adsl %>%
-  select(where(is.character)) %>%
-  names() %>%
-  intersect(var_spec %>% filter(type == "float") %>% pull(variable))
-# → shows which "float" variables are currently character
+# ── FIND THE CRASH ──────────────────────────────
+traceback()                     # call stack after error
 
-# Fix: coerce before xportr
-adsl <- adsl %>%
-  mutate(AGE = as.numeric(AGE))
+# ── INJECT INTO A PIPE ──────────────────────────
+df %>% { browser(); . }         # pause mid-pipe (. is the data)
+df %>% tap(cat("rows:", nrow(df), "\n"))   # print mid-pipe
 
-# "Warning: Variable label truncated to 200 chars"
-# → check your label lengths
-var_spec %>%
-  mutate(label_len = nchar(label)) %>%
-  filter(label_len > 200) %>%
-  select(variable, label, label_len)
-```
-
----
-
-## The Quick Reference
-
-```r
-# ── STOP AND LOOK ──────────────────────────────
-browser()                        # pause here, open REPL
-browser(expr = condition)        # pause only when condition is TRUE
-debugonce(some_function)         # pause at start of function, once
-options(error = recover)         # after any error, pick a frame to explore
-options(error = NULL)            # reset
-
-# ── FIND WHERE IT CRASHED ──────────────────────
-traceback()                      # call stack after error
-
-# ── INJECT INTO A PIPE ─────────────────────────
-df %>% { browser(); . }          # pause mid-pipe (. is the data)
-df %>% (function(x) { cat(nrow(x), "\n"); x })()  # print mid-pipe
-
-# ── HANDLE ERRORS ──────────────────────────────
-tryCatch(expr, error = function(e) ...)
-withCallingHandlers(expr, warning = function(w) ...)
-
-# ── CRASH LOUDLY ───────────────────────────────
+# ── CRASH LOUDLY ────────────────────────────────
 stopifnot(nrow(adsl) == 254)
 stop("Expected 254 subjects, got ", nrow(adsl))
 
-# ── CLINICAL-SPECIFIC ──────────────────────────
-# Check join uniqueness before joining
+# ── CLINICAL-SPECIFIC ───────────────────────────
+# Check join uniqueness
 before <- nrow(left_df)
 result <- left_join(left_df, right_df, by = "USUBJID")
-stopifnot("Join multiplied rows" = nrow(result) == before)
+stopifnot("Join expanded rows" = nrow(result) == before)
 
-# Check no unexpected NAs in flag variables
+# Date ordering
+bad <- adsl %>% filter(!is.na(TRTSDT) & !is.na(TRTEDT) & TRTEDT < TRTSDT)
+if (nrow(bad) > 0) stop(nrow(bad), " subjects with TRTEDT < TRTSDT")
+
+# Flag integrity
 stopifnot(all(adsl$ITTFL %in% c("Y", NA)))
+stopifnot(!any(duplicated(adsl$USUBJID)))
+```
 
-# Check date ordering
-bad_dates <- adsl %>% filter(!is.na(TRTSDT) & !is.na(TRTEDT) & TRTEDT < TRTSDT)
-if (nrow(bad_dates) > 0) stop(nrow(bad_dates), " subjects with TRTEDT < TRTSDT")
+---
+
+## What We Have Now: The Complete Pipeline
+
+```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM
+pharm001_ch03_dm.R       — map raw DM to SDTM
+pharm001_ch04.R          — derive TRTSDT, TRTEDT, TRTDURD
+pharm001_ch11_adsl.R     — complete ADSL (logged)
+pharm001_ch06_adae.R     — complete ADAE
+pharm001_ch09_export.R   — XPT export
+pharm001_ch07_t14_1_1.R  — Table 14.1.1
+pharm001_ch08_t14_3_1.R  — Table 14.3.1
+pharm001_ch10_app.R      — teal explorer
+pharm001_ch13_debug.R    — bug-finding script
+run_all.R                — run the complete pipeline
+output/adam/*.xpt        — submission-ready XPT files
+output/tlg/*.txt, *.png  — tables and figures
+logs/*.log               — audit trail
+renv.lock                — locked package versions
 ```
 
 ---
 
 ## Exercises
 
-**1. Inject browser() mid-admiral-chain**
+**1.** Implement `safe_join(left, right, by, type="left")`. Use it to replace every `left_join` in `pharm001_ch11_adsl.R`. Do any of them fire?
 
-Take the ADSL derivation from Chapter 5. After `derive_vars_dt(TRTS)`, inject `browser()` using the `{ browser(); . }` trick. Confirm you can inspect `TRTSDT` at that point.
+**2.** Introduce 3 more bugs in ADAE (swap `TRTEMFL` for two subjects, wrong `ASTDY` for one). Run `diffdf()` against `pharmaverseadam::adae`. Do you catch all three?
 
-**2. Build safe_join()**
+**3.** Use `debugonce(admiral::derive_vars_dt)` to step through the imputation logic for a subject with a partial `RFXENDTC`. Confirm you understand what the `date_imputation` argument does.
 
-Implement `safe_join(left, right, by, type="left")` that:
-- Performs the join
-- Crashes with a useful message if row count changes
-- Returns the joined dataset if counts match
-
-Use it for every join in your ADSL.
-
-**3. rtables pre-flight**
-
-Build `preflight_check(df, lyt)` that extracts all variables referenced in a layout and checks they exist in `df` with the right types.
-
-**4. diffdf on a buggy ADSL**
-
-Introduce 3 bugs into `pharmaverseadam::adsl` (swap TRTSDT for two subjects, change one AGEGR1, set one SAFFL to "N" wrongly). Run `diffdf()` to detect all three.
+**4.** The final exercise: run `run_all.R` from a clean R session (`Sys.setenv(R_LIBS_USER="")`) with only packages from `renv.lock`. Does everything still work? This is how submission QA works.
 
 ---
 
-*Debugging is the same skill everywhere. The pharmaverse doesn't change the tools — just the typical bugs.*
+*The pharmaverse doesn't change the debugging tools. It just gives you better things to debug.*

@@ -1,20 +1,28 @@
-# Chapter 10: Interactive Apps with {teal}
+# Chapter 10: Add a teal App
 
-*Build clinical data exploration apps using the teal Shiny framework.*
+*The clinicians want to explore PHARM-001 interactively. One demographics module. Then add KM.*
+
+---
+
+## Where We Left Off
+
+```
+output/adam/adsl.xpt, adae.xpt, adtte.xpt, adlb.xpt (Chapter 9)
+```
+
+The static tables are done. The SAP also calls for an interactive data explorer for internal review. We build it in teal.
 
 ---
 
 ## What teal Is
 
-`teal` is a Shiny-based framework for building interactive clinical trial data exploration apps. A teal app gives reviewers (statisticians, clinicians, regulators) an interactive interface to explore ADaM data without writing code.
-
-Built by Roche's engineering team (now insightsengineering), it's widely used internally and increasingly in submissions for exploratory interactive analyses.
+`teal` is a Shiny-based framework for clinical data exploration. A teal app gives reviewers — statisticians, clinicians, medical monitors — an interactive interface to explore ADaM data without writing code.
 
 Features:
-- **Filter panel** — global subject filters (treatment arm, population flag, demographics)
-- **Analysis modules** — pluggable analysis views (tables, KM plots, scatterplots, listings)
-- **Reproducibility code** — every analysis generates copy-pasteable R code
-- **Reporter** — export results to a PDF/Word report in-app
+- **Filter panel** — global subject filters that propagate to every module
+- **Analysis modules** — pluggable views (tables, KM plots, lab plots, listings)
+- **Reproducibility code** — every analysis shows the R code behind it
+- **Reporter** — export results to PDF/Word in-app
 
 ```r
 library(teal)
@@ -25,128 +33,105 @@ library(dplyr)
 
 ---
 
-## A Minimal teal App
+## Start with One Module
+
+Don't build the full app first. Start with one module.
 
 ```r
 library(teal)
 library(teal.modules.clinical)
 library(pharmaverseadam)
 
-# Load data
+# The data
 adsl <- pharmaverseadam::adsl
-adae <- pharmaverseadam::adae
 
-# Define data connectors (how teal loads the data)
-data <- teal_data(
-  ADSL = adsl,
-  ADAE = adae
-)
+data <- teal_data(ADSL = adsl)
 
-# Define app
+# One module: demographics summary
 app <- init(
   data = data,
-  
   modules = modules(
-    # Demographics summary
     tm_t_summary(
       label        = "Demographics",
       dataname     = "ADSL",
       arm_var      = choices_selected("TRT01A", selected = "TRT01A"),
       summarize_vars = choices_selected(
-        c("AGE","SEX","RACE","AGEGR1"),
-        selected = c("AGE","SEX","RACE")
+        c("AGE", "SEX", "RACE", "AGEGR1"),
+        selected = c("AGE", "SEX", "RACE")
+      )
+    )
+  ),
+  title = "PHARM-001 Clinical Data Explorer"
+)
+
+shinyApp(app$ui, app$server)
+```
+
+Run it. Click around. The filter panel appears automatically. Set `SAFFL == "Y"` in the filter panel — the demographics table updates. That's the key feature.
+
+---
+
+## Add the KM Module
+
+```r
+adsl  <- pharmaverseadam::adsl
+adtte <- pharmaverseadam::adtte
+
+data <- teal_data(
+  ADSL  = adsl,
+  ADTTE = adtte
+)
+
+app <- init(
+  data = data,
+  modules = modules(
+    
+    tm_t_summary(
+      label          = "Demographics",
+      dataname       = "ADSL",
+      arm_var        = choices_selected("TRT01A", selected = "TRT01A"),
+      summarize_vars = choices_selected(
+        c("AGE", "SEX", "RACE", "AGEGR1", "BMIBL"),
+        selected = c("AGE", "SEX", "RACE")
       )
     ),
     
-    # AE table
-    tm_t_events(
-      label       = "Adverse Events",
-      dataname    = "ADAE",
-      arm_var     = choices_selected("TRT01A", selected = "TRT01A"),
-      hlt         = choices_selected("AEBODSYS"),
-      llt         = choices_selected("AEDECOD"),
-      add_total   = TRUE
+    tm_g_km(
+      label    = "Kaplan-Meier",
+      dataname = "ADTTE",
+      arm_var  = choices_selected("TRT01A", selected = "TRT01A"),
+      paramcd  = choices_selected(
+        choices  = value_choices("ADTTE", "PARAMCD", "PARAM"),
+        selected = "OS"
+      )
     )
   ),
-  
-  title   = "Clinical Data Explorer",
-  footer  = "Pharmaverse Example"
+  title = "PHARM-001 Clinical Data Explorer"
 )
 
-# Run
 shinyApp(app$ui, app$server)
 ```
 
 ---
 
-## The Filter Panel
-
-The filter panel is teal's signature feature. Users can filter across all modules simultaneously:
+## The Full PHARM-001 Explorer
 
 ```r
-# You can pre-set default filters
-data <- teal_data(
-  ADSL = adsl,
-  ADAE = adae
-)
-
-# Users can add filters like:
-# ADSL: SAFFL == "Y"
-# ADSL: TRT01A %in% c("Drug A", "Placebo")
-# ADAE: AESER == "Y"
-```
-
-Filters propagate automatically to every module — if you filter to females only, every table and plot updates.
-
----
-
-## teal.modules.clinical — Available Modules
-
-```r
-# Demographics / Summary
-tm_t_summary()           # summary statistics table
-tm_t_demographics()      # demographics table
-
-# Adverse Events
-tm_t_events()            # AE incidence table by SOC/PT
-tm_t_events_summary()    # AE overview
-tm_t_max_grade_tbl()     # maximum grade table
-
-# Time-to-Event
-tm_g_km()               # Kaplan-Meier plot
-tm_t_tte()              # TTE summary table
-
-# Labs
-tm_g_lineplot()         # lab value over time
-tm_t_shift_by_arm()     # shift table (baseline vs worst)
-tm_t_summary_by()       # summary by visit
-
-# Exploration
-tm_t_crosstab()         # cross-tabulation
-tm_g_scatterplot()      # scatterplot
-tm_g_ipp()              # individual patient profile
-```
-
----
-
-## Program: Full Clinical Explorer App
-
-```r
-# clinical_explorer.R
-# A complete teal clinical data exploration app
+# pharm001_ch10_app.R
+# Study PHARM-001 — Chapter 10
+# Interactive clinical data explorer
 
 library(teal)
 library(teal.modules.clinical)
 library(pharmaverseadam)
 library(dplyr)
 
-# ---- Load and prepare data ----
+# ---- Load data ----
 adsl  <- pharmaverseadam::adsl
 adae  <- pharmaverseadam::adae
 adtte <- pharmaverseadam::adtte
 adlb  <- pharmaverseadam::adlb
 
-# Define data
 data <- teal_data(
   ADSL  = adsl,
   ADAE  = adae,
@@ -160,32 +145,31 @@ app <- init(
   
   modules = modules(
     
-    # ---- Tab: Subject Overview ----
+    # Tab 1: Demographics
     tm_t_summary(
-      label        = "Demographics & Baseline",
-      dataname     = "ADSL",
-      arm_var      = choices_selected(
-        choices  = variable_choices("ADSL", c("TRT01A","TRT01P")),
+      label          = "Demographics & Baseline",
+      dataname       = "ADSL",
+      arm_var        = choices_selected(
+        choices  = variable_choices("ADSL", c("TRT01A", "TRT01P")),
         selected = "TRT01A"
       ),
       summarize_vars = choices_selected(
-        choices  = variable_choices("ADSL", c("AGE","AGEGR1","SEX","RACE","ETHNIC",
-                                              "BMIBL","HEIGHTBL","WEIGHTBL")),
-        selected = c("AGE","AGEGR1","SEX","RACE")
-      ),
-      useNA = "ifany"
+        choices  = variable_choices("ADSL",
+                     c("AGE","AGEGR1","SEX","RACE","ETHNIC","BMIBL","HEIGHTBL","WEIGHTBL")),
+        selected = c("AGE", "AGEGR1", "SEX", "RACE")
+      )
     ),
     
-    # ---- Tab: Adverse Events ----
+    # Tab 2: AE Incidence
     tm_t_events(
-      label     = "AE Incidence by SOC/PT",
-      dataname  = "ADAE",
-      arm_var   = choices_selected("TRT01A", selected = "TRT01A"),
-      hlt       = choices_selected(
-        choices = variable_choices("ADAE", c("AEBODSYS","AEHLT")),
+      label      = "AE Incidence by SOC/PT",
+      dataname   = "ADAE",
+      arm_var    = choices_selected("TRT01A", selected = "TRT01A"),
+      hlt        = choices_selected(
+        choices  = variable_choices("ADAE", c("AEBODSYS", "AEHLT")),
         selected = "AEBODSYS"
       ),
-      llt = choices_selected(
+      llt        = choices_selected(
         choices  = variable_choices("ADAE", "AEDECOD"),
         selected = "AEDECOD"
       ),
@@ -193,32 +177,29 @@ app <- init(
       event_type = "adverse events"
     ),
     
-    # ---- Tab: AE Overview ----
+    # Tab 3: AE Overview
     tm_t_events_summary(
       label    = "AE Overview",
       dataname = "ADAE",
       arm_var  = choices_selected("TRT01A", selected = "TRT01A"),
       flag_var_anl = choices_selected(
-        choices  = variable_choices("ADAE", c("TRTEMFL","AESER")),
-        selected = c("TRTEMFL","AESER")
+        choices  = variable_choices("ADAE", c("TRTEMFL", "AESER")),
+        selected = c("TRTEMFL", "AESER")
       )
     ),
     
-    # ---- Tab: Survival ----
+    # Tab 4: Kaplan-Meier
     tm_g_km(
-      label      = "Kaplan-Meier Plot",
-      dataname   = "ADTTE",
-      arm_var    = choices_selected("TRT01A", selected = "TRT01A"),
-      paramcd    = choices_selected(
+      label    = "Kaplan-Meier Plot",
+      dataname = "ADTTE",
+      arm_var  = choices_selected("TRT01A", selected = "TRT01A"),
+      paramcd  = choices_selected(
         choices  = value_choices("ADTTE", "PARAMCD", "PARAM"),
         selected = "OS"
-      ),
-      xticks     = NULL,
-      conf_level = teal.transform::arm_var_choices_selected(list(ADSL = adsl)),
-      time_unit  = "AVALU"
+      )
     ),
     
-    # ---- Tab: Lab Values ----
+    # Tab 5: Lab Values
     tm_g_lineplot(
       label    = "Lab Value by Visit",
       dataname = "ADLB",
@@ -234,50 +215,84 @@ app <- init(
     )
   ),
   
-  title  = "Clinical Data Explorer — Phase III Study",
-  footer = paste("Data: pharmaverseadam | Built with teal", packageVersion("teal"))
+  title  = "PHARM-001 Clinical Data Explorer",
+  footer = paste("pharmaversesdtm + pharmaverseadam | teal", packageVersion("teal"))
 )
 
-# Launch
-cat("Launching app at http://localhost:3838/\n")
-cat("Press Ctrl+C to stop.\n")
+cat("Launching PHARM-001 explorer at http://localhost:3838/\n")
 shinyApp(app$ui, app$server, options = list(port = 3838, launch.browser = TRUE))
 ```
 
 ---
 
-## Deploying teal Apps
+## The Filter Panel
+
+The filter panel is teal's key feature. Users can filter across all modules simultaneously. To pre-set defaults:
 
 ```r
-# Deploy to Posit Connect (shinyapps.io or internal server)
-library(rsconnect)
-
-rsconnect::deployApp(
-  appDir    = ".",
-  appFiles  = c("clinical_explorer.R"),
-  appName   = "clinical-explorer",
-  account   = "your-account",
-  server    = "your-server"
-)
+# Pre-filter safety population
+# In the app, users see this filter already applied
+# They can remove or add more filters
 ```
 
-For internal deployment on Posit Connect, ask your IT team for the server URL and API token.
+Filters propagate automatically — if you filter to females only in the panel, every table and plot updates. This replaces the manual re-running of SAS programs for subgroup reviews.
+
+---
+
+## Available Modules
+
+```r
+# Demographics
+tm_t_summary()           # summary statistics
+tm_t_demographics()      # demographics table
+
+# Adverse Events
+tm_t_events()            # AE incidence by SOC/PT
+tm_t_events_summary()    # AE overview
+tm_t_max_grade_tbl()     # max grade table
+
+# Time-to-Event
+tm_g_km()               # Kaplan-Meier plot
+tm_t_tte()              # TTE summary table
+
+# Labs
+tm_g_lineplot()         # lab value over time
+tm_t_shift_by_arm()     # shift table
+
+# Exploration
+tm_t_crosstab()         # cross-tabulation
+tm_g_scatterplot()      # scatterplot
+tm_g_ipp()             # individual patient profile
+```
+
+---
+
+## What We Have Now
+
+```
+pharm001_ch01.R          — load DM, count subjects, demographics
+pharm001_ch02_validate.R — validate SDTM
+pharm001_ch03_dm.R       — map raw DM to SDTM
+pharm001_ch04.R          — derive TRTSDT, TRTEDT, TRTDURD
+pharm001_ch05_adsl.R     — complete ADSL
+pharm001_ch06_adae.R     — complete ADAE
+pharm001_ch07_t14_1_1.R  — Table 14.1.1 (demographics) + KM plot
+pharm001_ch08_t14_3_1.R  — Table 14.3.1 (TEAE by SOC/PT)
+pharm001_ch09_export.R   — export all ADaM to XPT
+pharm001_ch10_app.R      — interactive teal explorer (5 modules)
+output/adam/
+  adsl.xpt, adae.xpt, adtte.xpt, adlb.xpt
+```
 
 ---
 
 ## Exercises
 
-**1. Subgroup analysis module**
+**1.** Add `tm_t_crosstab()` to cross-tabulate AE incidence by sex and treatment arm.
 
-Add `tm_t_crosstab()` to the app: cross-tabulate AE incidence by sex and treatment arm.
+**2.** Add `tm_g_ipp()` (individual patient profile) for lab values. This shows one subject's values over time — useful for medical review.
 
-**2. Individual patient profile**
-
-Add `tm_g_ipp()` (individual patient profile) for lab values. This shows one subject's values over time.
-
-**3. Custom module**
-
-Write a custom teal module using `module()` that shows a barplot of AE frequency by body system. Use `renderPlot()` and `plotOutput()` from Shiny.
+**3.** Write a custom teal module that shows a barplot of AE frequency by body system:
 
 ```r
 my_ae_barplot <- module(
@@ -286,23 +301,26 @@ my_ae_barplot <- module(
   server   = function(id, data, filter_panel_api, reporter) {
     moduleServer(id, function(input, output, session) {
       output$plot <- renderPlot({
-        # your ggplot code here
+        df <- data[["ADAE"]]()
+        df %>%
+          filter(TRTEMFL == "Y") %>%
+          count(AEBODSYS) %>%
+          ggplot2::ggplot(ggplot2::aes(x = reorder(AEBODSYS, n), y = n)) +
+          ggplot2::geom_col() +
+          ggplot2::coord_flip() +
+          ggplot2::labs(x = NULL, y = "Subject count", title = "TEAEs by System Organ Class")
       })
     })
   },
   ui = function(id) {
     ns <- NS(id)
-    plotOutput(ns("plot"))
+    ggplot2::plotOutput(ns("plot"))
   }
 )
 ```
 
-**4. Pre-filter populations**
-
-Modify the app so the filter panel defaults to:
-- `ADSL`: `SAFFL == "Y"`
-- `ADAE`: `TRTEMFL == "Y"`
+**4. (Sets up Chapter 11)** Run `pharm001_ch10_app.R` and interact with it. Use the "Show R code" button on a module. Copy that code and run it outside the app. Does it reproduce the same output? This is the reproducibility feature. Chapter 11 adds logging so every program run — including the app — leaves an audit trail.
 
 ---
 
-*Next: Chapter 11 — Validation, Logging, and QC*
+*Next: Chapter 11 — we add logrx logging to every PHARM-001 program. Show what the log catches.*

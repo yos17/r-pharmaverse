@@ -1,219 +1,144 @@
-# Chapter 1: The Clinical Data World in R
+# Chapter 1: Study PHARM-001 Begins
 
-*Why R for pharma? The tidyverse. How your SAS habits translate.*
-
----
-
-## Why Pharmaverse?
-
-You already know clinical programming. SDTM domains. ADaM conventions. TLGs. Output specifications. You've done all of it in SAS.
-
-The question isn't *why learn R* — it's *how to map what you already know onto R and the pharmaverse toolchain.*
-
-The short answer: everything you do in SAS has an equivalent in the pharmaverse. The concepts are identical. Only the syntax and tooling differ.
-
-| SAS | R equivalent |
-|-----|-------------|
-| `PROC SORT` | `arrange()` (dplyr) |
-| `PROC MEANS` / `PROC UNIVARIATE` | `summarise()`, `describe()` |
-| `DATA` step merge | `left_join()`, `merge()` |
-| `PROC FREQ` | `count()`, `table()` |
-| `PROC REPORT` | `rtables` + `tern` |
-| `PROC EXPORT` (XPT) | `xportr` |
-| ADaM macros | `admiral` functions |
-| SDTM programming | `sdtm.oak` |
-| SAS formats/informats | `haven::labelled`, factor levels |
+*You have raw clinical data. Let's see what's in it.*
 
 ---
 
-## The Tidyverse — Your Main Dialect
+## The Problem
 
-In SAS, you write `DATA` steps and `PROC` steps. In R pharmaverse work, you'll write **tidyverse** code — a set of packages with a consistent grammar.
+You've been handed Study PHARM-001 — a Phase III trial of an experimental treatment vs. placebo. The data is in R packages. Your first task from the SAP: count subjects and print a basic demographics summary.
 
-The most important: **dplyr** (data manipulation) and **tidyr** (reshaping).
+Twenty lines. Let's go.
+
+---
+
+## The Data
+
+Study PHARM-001 lives in `pharmaversesdtm`. The Demographics domain `dm` is your starting point — one row per subject.
 
 ```r
-library(dplyr)
-library(tidyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+nrow(dm)        # all subjects including screen failures
+ncol(dm)        # variables
+names(dm)       # what's in there
 ```
 
-### The Pipe
+The columns that matter first: `USUBJID` (unique subject ID), `ACTARM` (actual treatment arm), `AGE`, `SEX`, `RACE`.
 
-The pipe `%>%` (or `|>` in base R 4.1+) chains operations. Read it as "then":
+---
+
+## SAS vs. R: The Translation Layer
+
+You know this data. You've worked with it in SAS. Here's the mapping:
+
+| SAS | R |
+|-----|---|
+| `PROC SORT` | `arrange()` |
+| `PROC MEANS` | `summarise()` |
+| `DATA` step merge | `left_join()` |
+| `PROC FREQ` | `count()` |
+| `WHERE` clause | `filter()` |
+| `KEEP=` | `select()` |
+| Assignment in DATA step | `mutate()` |
+
+The pipe `%>%` (or `|>`) chains operations. Read it as "then":
 
 ```r
-adsl %>%
-  filter(TRT01P == "Drug A") %>%
-  select(USUBJID, AGE, SEX, RACE) %>%
+dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  select(USUBJID, AGE, SEX) %>%
   arrange(USUBJID)
 ```
 
-Compare to SAS:
-```sas
-PROC SORT DATA=adsl(WHERE=(TRT01P="Drug A")
-                    KEEP=USUBJID AGE SEX RACE);
-  BY USUBJID;
-RUN;
-```
-
-Same logic. Different syntax.
+Same as sorting an input dataset, keeping three variables, and filtering in SAS — but in one readable chain.
 
 ---
 
-## dplyr: The Six Verbs
+## Step 1: Count Subjects
 
 ```r
 library(dplyr)
-library(pharmaversesdtm)  # example SDTM data
-
-dm <- pharmaversesdtm::dm   # Demographics domain
-
-# filter() — like WHERE in SAS
-dm %>% filter(ACTARM != "Screen Failure")
-
-# select() — keep/drop columns (like KEEP=/DROP= in DATA step)
-dm %>% select(USUBJID, SUBJID, SITEID, AGE, SEX, RACE, ETHNIC, ACTARM)
-
-# mutate() — add/modify columns (like assignment in DATA step)
-dm %>% mutate(
-  AGE_GROUP = case_when(
-    AGE < 40  ~ "<40",
-    AGE < 65  ~ "40-64",
-    TRUE      ~ ">=65"
-  )
-)
-
-# arrange() — PROC SORT
-dm %>% arrange(SITEID, USUBJID)
-
-# summarise() + group_by() — PROC MEANS/FREQ by group
-dm %>%
-  group_by(ACTARM) %>%
-  summarise(
-    n       = n(),
-    mean_age = mean(AGE, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# rename() — RENAME= option
-dm %>% rename(SUBJECT = USUBJID)
-```
-
----
-
-## Joining Datasets
-
-You'll do this constantly — merging SDTM domains, adding variables from DM to ADSL, etc.
-
-```r
-# Left join (equivalent to DATA step merge + IF _MERGE_)
-adsl <- left_join(dm_core, ex_derived, by = "USUBJID")
-
-# Multiple by-variables
-ae_with_demo <- left_join(ae, dm[, c("USUBJID","AGE","SEX")], 
-                           by = "USUBJID")
-
-# One-to-many: every AE row gets the subject's demographics
-```
-
-In SAS you'd sort both datasets and MERGE + BY. In dplyr you just join.
-
----
-
-## Reading and Writing Clinical Data
-
-```r
-library(haven)   # SAS XPT + SAS7BDAT reader/writer
-
-# Read SAS transport file (XPT)
-adsl <- haven::read_xpt("path/to/adsl.xpt")
-
-# Read SAS dataset
-dm <- haven::read_sas("path/to/dm.sas7bdat")
-
-# Write XPT (for submission — but use xportr for proper metadata)
-haven::write_xpt(adsl, "adsl.xpt")
-
-# Read/write CSV
-readr::write_csv(adsl, "adsl.csv")
-adsl <- readr::read_csv("adsl.csv")
-```
-
----
-
-## Labels in R
-
-SAS datasets carry variable labels. R's `haven` package preserves them as attributes.
-
-```r
-library(haven)
-library(labelled)
+library(pharmaversesdtm)
 
 dm <- pharmaversesdtm::dm
 
-# Variable labels are stored as attributes
-attr(dm$USUBJID, "label")   # "Unique Subject Identifier"
+# All subjects
+nrow(dm)
 
-# See all labels
-labelled::var_label(dm)
+# Screen failures excluded from analysis
+dm_enrolled <- dm %>% filter(ACTARM != "Screen Failure")
+nrow(dm_enrolled)
 
-# Set labels
-dm$AGE_GROUP <- dm$AGE_GROUP %>% labelled::set_variable_labels(
-  AGE_GROUP = "Age Group (Years)"
-)
+cat(sprintf("Enrolled: %d (of %d total, %d screen failures)\n",
+            nrow(dm_enrolled), nrow(dm), nrow(dm) - nrow(dm_enrolled)))
 ```
 
 ---
 
-## Program: Your First Pharmaverse Script
+## Step 2: Count by Arm
 
 ```r
-# first_pharmaverse.R
-# Load CDISC example data and do basic exploration
+dm_enrolled %>%
+  count(ACTARM) %>%
+  arrange(ACTARM)
+```
+
+---
+
+## Step 3: Age Summary
+
+```r
+dm_enrolled %>%
+  group_by(ACTARM) %>%
+  summarise(
+    n        = n(),
+    mean_age = round(mean(AGE, na.rm = TRUE), 1),
+    sd_age   = round(sd(AGE, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+```
+
+---
+
+## The First PHARM-001 Program
+
+```r
+# pharm001_ch01.R
+# Study PHARM-001 — Chapter 1
+# Load DM, count subjects, print basic demographics
 
 library(tidyverse)
-library(haven)
-library(labelled)
 library(pharmaversesdtm)
 
-# ---- Load SDTM data ----
+# ---- Load ----
 dm  <- pharmaversesdtm::dm
 ae  <- pharmaversesdtm::ae
-vs  <- pharmaversesdtm::vs
-ex  <- pharmaversesdtm::ex
 
-cat("=== Dataset Overview ===\n")
-datasets <- list(dm=dm, ae=ae, vs=vs, ex=ex)
-for (nm in names(datasets)) {
-  d <- datasets[[nm]]
-  cat(sprintf("%-5s: %4d rows × %2d cols\n", 
-              toupper(nm), nrow(d), ncol(d)))
-}
-
-# ---- Screen failures ----
-# In clinical trials, screen failures are excluded from analysis
+# ---- Enrolled subjects ----
 dm_enrolled <- dm %>% filter(ACTARM != "Screen Failure")
-cat(sprintf("\nEnrolled subjects: %d (of %d total)\n",
-            nrow(dm_enrolled), nrow(dm)))
 
-# ---- Demographics summary ----
-cat("\n=== Demographics by Treatment Arm ===\n")
+cat(sprintf("Study PHARM-001\n"))
+cat(sprintf("Total screened:    %d\n", nrow(dm)))
+cat(sprintf("Screen failures:   %d\n", nrow(dm) - nrow(dm_enrolled)))
+cat(sprintf("Enrolled:          %d\n", nrow(dm_enrolled)))
 
-# Age by arm
+# ---- Age by arm ----
+cat("\nAge by treatment arm:\n")
 age_summary <- dm_enrolled %>%
   group_by(ACTARM) %>%
   summarise(
     n        = n(),
-    mean_age = round(mean(AGE, na.rm=TRUE), 1),
-    sd_age   = round(sd(AGE,  na.rm=TRUE), 1),
-    min_age  = min(AGE, na.rm=TRUE),
-    max_age  = max(AGE, na.rm=TRUE),
+    mean_age = round(mean(AGE, na.rm = TRUE), 1),
+    sd_age   = round(sd(AGE, na.rm = TRUE), 1),
+    min_age  = min(AGE, na.rm = TRUE),
+    max_age  = max(AGE, na.rm = TRUE),
     .groups  = "drop"
   )
 
-cat("\nAge:\n")
 for (i in seq_len(nrow(age_summary))) {
-  cat(sprintf("  %-30s n=%d  Mean(SD)=%.1f(%.1f)  Range=%d-%d\n",
+  cat(sprintf("  %-35s n=%d  Mean(SD)=%.1f(%.1f)  Range=%d-%d\n",
               age_summary$ACTARM[i],
               age_summary$n[i],
               age_summary$mean_age[i],
@@ -222,95 +147,104 @@ for (i in seq_len(nrow(age_summary))) {
               age_summary$max_age[i]))
 }
 
-# Sex by arm
+# ---- Sex by arm ----
+cat("\nSex by arm:\n")
 sex_table <- dm_enrolled %>%
   count(ACTARM, SEX) %>%
   group_by(ACTARM) %>%
   mutate(pct = round(100 * n / sum(n), 1)) %>%
   ungroup()
 
-cat("\nSex:\n")
 for (i in seq_len(nrow(sex_table))) {
-  cat(sprintf("  %-30s %-2s n=%d (%.1f%%)\n",
+  cat(sprintf("  %-35s %-2s n=%d (%.1f%%)\n",
               sex_table$ACTARM[i], sex_table$SEX[i],
               sex_table$n[i], sex_table$pct[i]))
 }
 
-# ---- Adverse events summary ----
-cat("\n=== Adverse Events ===\n")
-ae_with_arm <- ae %>%
-  inner_join(dm_enrolled %>% select(USUBJID, ACTARM), by="USUBJID")
-
-ae_summary <- ae_with_arm %>%
+# ---- AE count ----
+ae_count <- ae %>%
+  inner_join(dm_enrolled %>% select(USUBJID, ACTARM), by = "USUBJID") %>%
   group_by(ACTARM) %>%
-  summarise(
-    n_subjects = n_distinct(USUBJID),
-    n_events   = n(),
-    n_serious  = sum(AESER == "Y", na.rm=TRUE),
-    .groups    = "drop"
-  )
+  summarise(n_subjects = n_distinct(USUBJID), n_events = n(), .groups = "drop")
 
-n_per_arm <- dm_enrolled %>% count(ACTARM, name="total_n")
-ae_summary <- ae_summary %>%
-  left_join(n_per_arm, by="ACTARM") %>%
-  mutate(ae_pct = round(100 * n_subjects / total_n, 1))
-
-for (i in seq_len(nrow(ae_summary))) {
-  cat(sprintf("  %-30s: %d/%d subjects (%s%%) with AEs, %d serious\n",
-              ae_summary$ACTARM[i],
-              ae_summary$n_subjects[i],
-              ae_summary$total_n[i],
-              ae_summary$ae_pct[i],
-              ae_summary$n_serious[i]))
+cat("\nAE overview:\n")
+for (i in seq_len(nrow(ae_count))) {
+  cat(sprintf("  %-35s %d subjects, %d events\n",
+              ae_count$ACTARM[i], ae_count$n_subjects[i], ae_count$n_events[i]))
 }
 ```
 
 ---
 
-## Key Differences from SAS
+## Key R Concepts for SAS Programmers
 
-1. **Observations vs. variables**: In R, `nrow()` = number of records, `ncol()` = number of variables. In SAS it's "observations" and "variables."
+**Missing values:** R uses `NA` for all types. SAS uses `.` for numeric. After reading XPT with `haven`, SAS `.` becomes `NA`. Always use `na.rm = TRUE` in summary functions.
 
-2. **Missing values**: R uses `NA` for all types. SAS uses `.` for numeric and `" "` for character. After reading XPT with `haven`, SAS `.` becomes `NA`. Be aware: `haven` also has `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_` typed NAs.
+**Character case:** R is case-sensitive. `"MALE"` ≠ `"Male"`. SDTM uses uppercase CT values.
 
-3. **Character case**: R is case-sensitive. `"MALE"` ≠ `"Male"`. SAS functions like `UPCASE` → use `toupper()` in R.
+**Dates:** SAS dates are days since Jan 1, 1960. R dates are days since Jan 1, 1970. `haven::read_xpt()` converts automatically. SDTM stores dates as ISO8601 character strings — we'll convert them in Chapter 4.
 
-4. **Factors vs. formats**: SAS formats are like R's factors but different. `haven` reads SAS formats as labelled vectors. Use `haven::as_factor()` to convert.
+**Labels:** SAS variable labels live as attributes in R. `attr(dm$USUBJID, "label")` gives you `"Unique Subject Identifier"`. Package `labelled` lets you set and view them.
 
-5. **Date handling**: SAS dates are integers (days since Jan 1, 1960). R dates are integers (days since Jan 1, 1970). `haven` converts automatically.
+---
+
+## What We Have Now
+
+```
+pharm001_ch01.R       # 20 lines: load dm, count subjects, demographics summary
+```
+
+Run it:
+```r
+source("pharm001_ch01.R")
+```
+
+Output: subject counts by arm, age mean/SD/range, sex breakdown, AE count.
+
+---
+
+## Joining Datasets
+
+You'll do this constantly. The pattern:
+
+```r
+# One AE row gets the subject's demographics — same as SAS MERGE + BY
+ae_with_demo <- ae %>%
+  left_join(dm_enrolled %>% select(USUBJID, AGE, SEX, ACTARM),
+            by = "USUBJID")
+```
+
+Warning: if `dm_enrolled` had duplicate `USUBJID` rows, this would multiply AE rows. We'll deal with that in Chapter 13.
 
 ---
 
 ## Exercises
 
-**1. Load and explore**
+**1.** Load `dm`, `ae`, `vs`, `ex` from `pharmaversesdtm`. For each: how many rows? How many distinct USUBJIDs? Are all AE subjects in DM?
 
-Install `pharmaversesdtm`. Load `dm`, `ae`, `vs`, `ex`. For each:
-- How many rows and columns?
-- What are the key variables?
-- Are there any `NA` values? Where?
-
-**2. Rewrite in dplyr**
-
-Translate this pseudo-SAS to dplyr:
+**2.** Translate this to dplyr:
 ```sas
 DATA want;
   SET dm;
   WHERE SEX = "F" AND AGE >= 50;
   KEEP USUBJID AGE RACE ACTARM;
-  IF ACTARM = "Placebo" THEN ARM_LABEL = "PBO";
-  ELSE ARM_LABEL = "ACTIVE";
 RUN;
 ```
 
-**3. Join practice**
+**3.** Find the subject with the most AEs. What arm are they in?
 
-Create a dataset with one row per AE, including the subject's age, sex, and treatment arm. How many AEs does the oldest subject have?
-
-**4. First summary**
-
-Produce a frequency table of `AEDECOD` (adverse event preferred term) sorted by descending count.
+**4. (Sets up Chapter 2)** The variable `RFSTDTC` in DM holds the reference start date as an ISO8601 character string. Look at its values. How would you convert it to an R `Date`? What happens to subjects where it's `NA`? Write a function that converts it and counts how many subjects have a valid date.
 
 ---
 
-*Next: Chapter 2 — CDISC Standards in Code: metadata, codelists, and the controlled terminology mindset*
+## What's Next
+
+Chapter 2: we inspect the SDTM domains more carefully, validate one variable against controlled terminology, and understand why character constants matter.
+
+Current pipeline:
+
+```
+pharm001_ch01.R    [done] — load DM, count subjects, basic demographics
+```
+
+*Next chapter adds the first real quality check to that foundation.*
