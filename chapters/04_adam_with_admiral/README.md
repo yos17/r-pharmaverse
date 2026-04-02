@@ -20,6 +20,19 @@ The SAP for PHARM-001 requires `TRTSDT` (treatment start date) and `TRTEDT` (tre
 
 Last chapter's exercise showed that `RFXSTDTC` is missing for some subjects. Let's try the naive approach first:
 
+**In SAS:**
+```sas
+DATA adsl_naive;
+  SET dm;
+  WHERE ACTARM NE "Screen Failure";
+  TRTSDT = INPUT(RFXSTDTC, YYMMDD10.);
+  TRTEDT = INPUT(RFXENDTC, YYMMDD10.);
+  FORMAT TRTSDT TRTEDT DATE9.;
+  /* Problem: partial dates like "2014-03" cause INPUT to return missing */
+RUN;
+```
+
+**In R (naive approach):**
 ```r
 library(dplyr)
 library(pharmaversesdtm)
@@ -42,6 +55,16 @@ That works for complete dates. Now try it with a partial date:
 
 ```r
 as.Date("2014-03")    # NA — partial dates fail silently
+```
+
+**In SAS:**
+```sas
+/* SAS INPUT also fails on partial dates */
+DATA test;
+  dtc = "2014-03";
+  dt  = INPUT(dtc, YYMMDD10.);  /* dt = . (missing) — silent failure */
+  FORMAT dt DATE9.;
+RUN;
 ```
 
 CDISC specifies imputation rules for partial dates. A date like `"2014-03"` (month known, day missing) should be imputed as `"2014-03-01"` (first of month) or `"2014-03-31"` (last of month) depending on context. `as.Date()` doesn't do this. Admiral does.
@@ -87,8 +110,68 @@ This is how admiral passes unquoted column names into functions — the same mec
 
 ---
 
+## The BY-group Pattern: SAS vs. R
+
+SAS programmers think in BY-groups — sorted data + `BY` statement in a `DATA` step.
+
+**In SAS:**
+```sas
+/* BY-group processing to get first record per subject */
+PROC SORT DATA=ex OUT=ex_sorted;
+  BY USUBJID EXSTDTC;
+RUN;
+
+DATA ex_first;
+  SET ex_sorted;
+  BY USUBJID;
+  IF FIRST.USUBJID;  /* keep only first record per subject */
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+# group_by() is the R equivalent of "BY USUBJID"
+# No sorting needed first — group_by works on unsorted data
+ex_first <- ex %>%
+  group_by(USUBJID) %>%
+  arrange(EXSTDTC, .by_group = TRUE) %>%
+  slice_head(n = 1) %>%      # equivalent of FIRST.USUBJID
+  ungroup()
+```
+
+| SAS | R |
+|-----|---|
+| `PROC SORT; BY USUBJID;` | Not needed (group_by works unsorted) |
+| `BY USUBJID;` in DATA step | `group_by(USUBJID)` |
+| `IF FIRST.USUBJID` | `slice_head(n = 1)` |
+| `IF LAST.USUBJID` | `slice_tail(n = 1)` |
+
+---
+
 ## derive_vars_dt(): What It Actually Does
 
+**In SAS (manual imputation):**
+```sas
+DATA adsl;
+  SET dm;
+  /* Complete dates: convert directly */
+  IF LENGTH(TRIM(RFXSTDTC)) = 10 THEN
+    TRTSDT = INPUT(RFXSTDTC, YYMMDD10.);
+  /* Partial date (YYYY-MM): impute to first of month */
+  ELSE IF LENGTH(TRIM(RFXSTDTC)) = 7 THEN DO;
+    TRTSDT  = INPUT(CATS(RFXSTDTC, "-01"), YYMMDD10.);
+    TRTSDTF = "D";  /* day imputed */
+  END;
+  /* Partial date (YYYY): impute to Jan 1 */
+  ELSE IF LENGTH(TRIM(RFXSTDTC)) = 4 THEN DO;
+    TRTSDT  = INPUT(CATS(RFXSTDTC, "-01-01"), YYMMDD10.);
+    TRTSDTF = "MD";  /* month and day imputed */
+  END;
+  FORMAT TRTSDT DATE9.;
+RUN;
+```
+
+**In R (pharmaverse — admiral):**
 ```r
 library(admiral)
 library(pharmaversesdtm)
@@ -173,17 +256,19 @@ if (nrow(bad_dates) > 0) {
 
 CDISC study day has no day 0: the day before the reference date is day -1, the reference date is day 1.
 
-```r
-adsl <- adsl %>%
-  mutate(
-    RFSTDT = as.Date(RFSTDTC),
-    TRTSDY = case_when(
-      TRTSDT >= RFSTDT ~ as.integer(TRTSDT - RFSTDT) + 1L,
-      TRTSDT  < RFSTDT ~ as.integer(TRTSDT - RFSTDT),
-      TRUE             ~ NA_integer_
-    )
-  )
+**In SAS:**
+```sas
+/* Manual CDISC study day calculation — no day 0 */
+DATA adsl;
+  SET adsl;
+  IF TRTSDT >= RFSTDT THEN TRTSDY =  TRTSDT - RFSTDT + 1;
+  ELSE                     TRTSDY =  TRTSDT - RFSTDT;
+  /* Some CDISC programming environments use a company macro: */
+  /* %STUDYDAY(STARTDT=RFSTDT, DT=TRTSDT, DY=TRTSDY) */
+RUN;
 ```
+
+**In R (pharmaverse — admiral):**
 
 Admiral provides `derive_vars_dy()` which handles this correctly for all variables at once:
 
@@ -198,6 +283,22 @@ adsl <- adsl %>%
 
 ### Age Groups
 
+**In SAS:**
+```sas
+DATA adsl;
+  SET adsl;
+  IF      AGE < 40              THEN AGEGR1 = "<40";
+  ELSE IF AGE >= 40 AND AGE < 65 THEN AGEGR1 = "40-64";
+  ELSE IF AGE >= 65              THEN AGEGR1 = ">=65";
+  ELSE                                AGEGR1 = "";
+
+  IF      AGEGR1 = "<40"   THEN AGEGR1N = 1;
+  ELSE IF AGEGR1 = "40-64" THEN AGEGR1N = 2;
+  ELSE IF AGEGR1 = ">=65"  THEN AGEGR1N = 3;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 adsl <- adsl %>%
   mutate(
@@ -217,6 +318,21 @@ adsl <- adsl %>%
 
 ### Treatment Arms
 
+**In SAS:**
+```sas
+DATA adsl;
+  SET adsl;
+  TRT01P  = ACTARM;
+  TRT01A  = ACTARM;
+  /* Numeric codes must be hard-coded or derived from a format */
+  IF      ACTARM = "Drug A" THEN TRT01PN = 1;
+  ELSE IF ACTARM = "Drug B" THEN TRT01PN = 2;
+  ELSE IF ACTARM = "Placebo" THEN TRT01PN = 3;
+  TRT01AN = TRT01PN;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 adsl <- adsl %>%
   mutate(

@@ -43,6 +43,77 @@ Submission Package
 
 ---
 
+## SAS Autoexec / run_all Equivalent
+
+**In SAS**, the equivalent of `run_all.R` is a master control program or autoexec:
+
+```sas
+/* run_all.sas — Master control program */
+/* Setup: library references, macro library */
+%INCLUDE "setup/autoexec.sas";           /* R equivalent: source() */
+
+/* SDTM */
+%INCLUDE "programs/sdtm/dm.sas";         /* R: source() or axecute() */
+%INCLUDE "programs/sdtm/ae.sas";
+
+/* ADaM */
+%INCLUDE "programs/adam/adsl.sas";
+%INCLUDE "programs/adam/adae.sas";
+
+/* TLG */
+%INCLUDE "programs/tlg/t14_1_1.sas";
+%INCLUDE "programs/tlg/t14_3_1.sas";
+```
+
+| SAS | R |
+|-----|---|
+| `%INCLUDE "program.sas";` | `source("program.R")` |
+| SAS autoexec.sas | `source("setup/options.R")` |
+| Macro library (`%MACRO`, `SASAUTOS=`) | R package / `source()` |
+| `LIBNAME adam "output/adam/";` | Working directory + `here::here()` |
+
+---
+
+## Metadata Catalog: SAS vs. metacore
+
+**In SAS**, variable metadata (labels, types, formats) lives in a SAS catalog or dataset:
+```sas
+/* SAS metadata catalog approach */
+PROC FORMAT CNTLOUT=fmtcat;   /* export format catalog */
+RUN;
+
+PROC CONTENTS DATA=adsl OUT=adsl_meta; /* export variable metadata */
+RUN;
+```
+
+**In R (pharmaverse — metacore):**
+```r
+library(metacore)
+
+# metacore loads metadata from a spec Excel file
+spec <- spec_to_metacore(
+  path              = "specs/ADaM_spec.xlsx",
+  where_sep_sheet   = FALSE
+)
+
+# The metacore object contains:
+# - Variable labels and types
+# - Dataset-level metadata
+# - Codelists for CT validation
+# - Everything xportr needs for export
+
+# Use it in the xportr pipeline
+adsl %>%
+  xportr_type(spec,   domain = "ADSL") %>%
+  xportr_label(spec,  domain = "ADSL") %>%
+  xportr_length(spec, domain = "ADSL") %>%
+  xportr_format(spec, domain = "ADSL") %>%
+  xportr_order(spec,  domain = "ADSL") %>%
+  xportr_write("output/adam/adsl.xpt")
+```
+
+---
+
 ## run_all.R
 
 ```r
@@ -157,6 +228,29 @@ for (f in c(
 | `pharm001_ch08_t14_3_1.R` | `output/tlg/t14_3_1.txt` |
 | `pharm001_ch10_app.R` | Interactive teal app |
 | `run_all.R` | Runs everything in order |
+
+---
+
+## Study Folder Structure: SAS and R Are the Same
+
+The folder structure for a regulatory submission is the same whether you use SAS or R. This is intentional — the ICH E3 and FDA submission guidelines are platform-agnostic.
+
+**Both SAS and R studies use:**
+```
+study/
+├── programs/          # programming files (.sas or .R)
+│   ├── sdtm/
+│   ├── adam/
+│   └── tlg/
+├── output/            # produced datasets and tables
+│   ├── adam/         # XPT files (same format regardless of origin language)
+│   └── tlg/
+├── logs/              # one log per program run
+├── specs/             # variable specs, define.xml
+└── [renv.lock | SAS version file]   # version control
+```
+
+The XPT format is binary and identical whether produced by SAS or R + `xportr`. An FDA reviewer cannot tell the difference.
 
 ---
 

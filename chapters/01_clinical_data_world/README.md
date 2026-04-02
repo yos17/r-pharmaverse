@@ -45,6 +45,16 @@ You know this data. You've worked with it in SAS. Here's the mapping:
 
 The pipe `%>%` (or `|>`) chains operations. Read it as "then":
 
+**In SAS:**
+```sas
+/* Sort, keep 3 variables, filter */
+PROC SORT DATA=dm(KEEP=USUBJID AGE SEX WHERE=(ACTARM NE "Screen Failure"))
+          OUT=dm_filtered;
+  BY USUBJID;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 dm %>%
   filter(ACTARM != "Screen Failure") %>%
@@ -54,10 +64,53 @@ dm %>%
 
 Same as sorting an input dataset, keeping three variables, and filtering in SAS — but in one readable chain.
 
+> ⚠️ **Critical difference:** SAS string comparison is **case-insensitive** (`"Screen Failure"` = `"screen failure"` = `"SCREEN FAILURE"`). R is **case-sensitive**: `"Screen Failure" != "screen failure"`. Always verify the exact case of CT values in R.
+
+---
+
+## Reading XPT Files
+
+In real studies, data arrives as SAS XPT transport files.
+
+**In SAS:**
+```sas
+LIBNAME adam XPORT 'path/to/adsl.xpt';
+DATA adsl;
+  SET adam.adsl;
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+library(haven)
+adsl <- haven::read_xpt("path/to/adsl.xpt")
+```
+
+> **Note on dates:** SAS dates are stored as days since **January 1, 1960**. R `Date` objects count days since **January 1, 1970**. `haven::read_xpt()` handles this conversion automatically — you get proper R `Date` objects.
+
 ---
 
 ## Step 1: Count Subjects
 
+**In SAS:**
+```sas
+/* Count all subjects */
+PROC SQL;
+  SELECT COUNT(*) AS N FROM dm;
+QUIT;
+
+/* Exclude screen failures */
+DATA dm_enrolled;
+  SET dm;
+  WHERE ACTARM NE "Screen Failure";
+RUN;
+
+PROC SQL;
+  SELECT COUNT(*) AS N_ENROLLED FROM dm_enrolled;
+QUIT;
+```
+
+**In R (pharmaverse):**
 ```r
 library(dplyr)
 library(pharmaversesdtm)
@@ -79,6 +132,14 @@ cat(sprintf("Enrolled: %d (of %d total, %d screen failures)\n",
 
 ## Step 2: Count by Arm
 
+**In SAS:**
+```sas
+PROC FREQ DATA=dm_enrolled;
+  TABLES ACTARM / NOCUM;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 dm_enrolled %>%
   count(ACTARM) %>%
@@ -89,6 +150,15 @@ dm_enrolled %>%
 
 ## Step 3: Age Summary
 
+**In SAS:**
+```sas
+PROC MEANS DATA=dm_enrolled N MEAN STD;
+  CLASS ACTARM;
+  VAR AGE;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 dm_enrolled %>%
   group_by(ACTARM) %>%
@@ -97,6 +167,43 @@ dm_enrolled %>%
     mean_age = round(mean(AGE, na.rm = TRUE), 1),
     sd_age   = round(sd(AGE, na.rm = TRUE), 1),
     .groups  = "drop"
+  )
+```
+
+> **Missing values:** SAS uses `.` for numeric missing and `" "` for character missing. R uses `NA` for all types. When reading SAS XPT files with `haven`, SAS `.` becomes `NA`. Always use `na.rm = TRUE` in summary functions.
+
+---
+
+## Variable Labels
+
+SDTM and ADaM datasets carry variable labels. In SAS these are native; in R they're stored as attributes.
+
+**In SAS:**
+```sas
+/* Labels are always visible in PROC CONTENTS, PROC PRINT, etc. */
+PROC CONTENTS DATA=dm;
+RUN;
+/* AGE — Age (label from dataset) */
+
+/* Setting labels: */
+DATA dm;
+  SET dm;
+  LABEL AGE      = "Age"
+        USUBJID  = "Unique Subject Identifier";
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+# Read the label of a single variable
+attr(dm$USUBJID, "label")   # "Unique Subject Identifier"
+
+# Set labels with labelled package
+library(labelled)
+dm <- dm %>%
+  set_variable_labels(
+    AGE     = "Age",
+    USUBJID = "Unique Subject Identifier"
   )
 ```
 
@@ -207,6 +314,23 @@ Output: subject counts by arm, age mean/SD/range, sex breakdown, AE count.
 
 You'll do this constantly. The pattern:
 
+**In SAS:**
+```sas
+/* One AE row gets the subject's demographics */
+PROC SORT DATA=ae;       BY USUBJID; RUN;
+PROC SORT DATA=dm_enrolled; BY USUBJID; RUN;
+
+DATA ae_with_demo;
+  MERGE ae(IN=inAE)
+        dm_enrolled(IN=inDM KEEP=USUBJID AGE SEX ACTARM);
+  BY USUBJID;
+  IF inAE;   /* keep all AE records */
+RUN;
+```
+
+> ⚠️ SAS `MERGE` requires sorted datasets. If `dm_enrolled` had duplicate `USUBJID` rows, the merge result can be unpredictable. The R `left_join` similarly multiplies AE rows if `dm_enrolled` had duplicates.
+
+**In R (pharmaverse):**
 ```r
 # One AE row gets the subject's demographics — same as SAS MERGE + BY
 ae_with_demo <- ae %>%

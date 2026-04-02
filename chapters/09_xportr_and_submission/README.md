@@ -23,6 +23,41 @@ Chapter 8's exercise: you wrote `haven::write_xpt(adsl, "adsl_naive.xpt")` and r
 
 ---
 
+## SAS vs. R: XPT Export
+
+In SAS, creating an XPT file uses the XPORT LIBNAME engine. In R, `xportr` provides an equivalent pipeline.
+
+**In SAS (full metadata XPT export):**
+```sas
+/* Apply metadata all at once with ATTRIB statement */
+DATA adsl;
+  SET adsl;
+  ATTRIB
+    STUDYID  LABEL="Study Identifier"               LENGTH=$200
+    USUBJID  LABEL="Unique Subject Identifier"       LENGTH=$200
+    AGE      LABEL="Age"                             LENGTH=8
+    AGEGR1   LABEL="Pooled Age Group 1"             LENGTH=$20
+    TRTSDT   LABEL="Date of First Exposure"          LENGTH=8  FORMAT=DATE9.
+    TRTEDT   LABEL="Date of Last Exposure"           LENGTH=8  FORMAT=DATE9.
+    SAFFL    LABEL="Safety Population Flag"          LENGTH=$2;
+RUN;
+
+/* Export to XPT */
+LIBNAME out XPORT 'output/adam/adsl.xpt';
+OPTIONS VALIDVARNAME=UPCASE;   /* SAS XPT requires uppercase variable names */
+DATA out.adsl;
+  SET adsl;
+RUN;
+
+/* Verify */
+PROC CONTENTS DATA=out.adsl;
+RUN;
+```
+
+> ⚠️ **`OPTIONS VALIDVARNAME=UPCASE`:** SAS XPT format requires all variable names to be uppercase (≤8 characters). This option enforces it. In R, you must ensure column names are uppercase before calling `xportr_write()`.
+
+---
+
 ## What xportr Does
 
 `xportr` applies metadata (from a spec) to an R data frame before writing to XPT:
@@ -32,7 +67,7 @@ ADSL → xportr_type() → xportr_label() → xportr_length() →
        xportr_format() → xportr_order() → xportr_write()
 ```
 
-Each step applies one aspect of the metadata. Chain them:
+Each step applies one aspect of the metadata. This is the R equivalent of the SAS `ATTRIB` statement — but done step by step with explicit validation.
 
 ```r
 library(xportr)
@@ -41,6 +76,19 @@ library(dplyr)
 
 adsl <- pharmaverseadam::adsl
 ```
+
+---
+
+## Individual xportr Steps: SAS Equivalents
+
+| SAS | R (xportr) |
+|-----|-----------|
+| `LABEL var = "text";` | `xportr_label(metadata=...)` |
+| `LENGTH var 8;` / `LENGTH $var $200;` | `xportr_length(metadata=...)` |
+| `FORMAT var DATE9.;` | `xportr_format(metadata=...)` |
+| Variable order in `DATA` step | `xportr_order(metadata=...)` |
+| `TYPE=` in ATTRIB | `xportr_type(metadata=...)` |
+| `LIBNAME out XPORT '...'; DATA out.adsl; SET adsl; RUN;` | `xportr_write(path=...)` |
 
 ---
 
@@ -84,6 +132,22 @@ var_spec_adsl <- tibble::tribble(
 
 ## The xportr Pipeline
 
+**In SAS:**
+```sas
+/* All metadata + export in one DATA step */
+DATA out.adsl;
+  SET adsl;
+  ATTRIB
+    STUDYID LENGTH=$200 LABEL="Study Identifier"
+    USUBJID LENGTH=$200 LABEL="Unique Subject Identifier"
+    TRTSDT  LENGTH=8    LABEL="Date of First Exposure to Treatment" FORMAT=DATE9.
+    TRTEDT  LENGTH=8    LABEL="Date of Last Exposure to Treatment"  FORMAT=DATE9.
+    SAFFL   LENGTH=$2   LABEL="Safety Population Flag";
+  /* Variable order follows the order in the DATA statement's KEEP= or the SET order */
+RUN;
+```
+
+**In R (pharmaverse — xportr):**
 ```r
 dir.create("output/adam", recursive = TRUE, showWarnings = FALSE)
 
@@ -98,8 +162,20 @@ adsl_xpt <- adsl %>%
                label = "Subject-Level Analysis Dataset")
 ```
 
-Now verify:
+---
 
+## Verify the Round-Trip
+
+**In SAS:**
+```sas
+/* Verify XPT contents */
+LIBNAME check XPORT 'output/adam/adsl.xpt';
+PROC CONTENTS DATA=check.adsl;
+RUN;
+/* Check: labels, formats, lengths, variable order */
+```
+
+**In R (pharmaverse):**
 ```r
 # Read back and check
 adsl_check <- haven::read_xpt("output/adam/adsl.xpt")
@@ -113,6 +189,14 @@ attr(adsl_check$TRTSDT,  "label")   # "Date of First Exposure to Treatment"
 # Date format?
 attr(adsl_check$TRTSDT, "format.sas")   # "DATE9."
 ```
+
+---
+
+## Date Storage in XPT: The 1960/1970 Difference
+
+> ⚠️ **Critical:** SAS dates are stored as days since **January 1, 1960**. R `Date` objects count days since **January 1, 1970**. The difference is **3,653 days**.
+>
+> When `xportr` (via `haven`) writes an R `Date` column to XPT, it automatically adjusts for this offset. When you read the XPT back with `haven::read_xpt()`, the reverse conversion happens. The conversion is transparent as long as you use `haven` — but if you ever look at raw XPT numeric values, they'll be 3,653 higher than the equivalent R integer.
 
 ---
 
@@ -212,10 +296,12 @@ cat("\nExport complete.\n")
 
 ## Submission Folder Structure
 
+The folder structure is essentially the same in SAS and R projects — regulatory expectations are platform-agnostic:
+
 ```
 pharm001/
 ├── programs/
-│   ├── sdtm/        dm.R, ae.R, ex.R, ...
+│   ├── sdtm/        dm.R, ae.R, ex.R, ...    (was: dm.sas, ae.sas, ...)
 │   ├── adam/        adsl.R, adae.R, adtte.R, adlb.R
 │   └── tlg/         t_14_1_1.R, t_14_3_1.R, f_14_2_1.R, ...
 ├── output/
@@ -223,7 +309,7 @@ pharm001/
 │   └── tlg/         t14_1_1.txt, t14_3_1.txt, f14_2_1.png
 ├── logs/            one .log per program (Chapter 11)
 ├── specs/           variable spec, define.xml
-└── renv.lock        package versions
+└── renv.lock        package versions  (was: SAS version + macro catalog)
 ```
 
 ---

@@ -32,10 +32,20 @@ vs  <- pharmaversesdtm::vs   # Vital Signs
 ds  <- pharmaversesdtm::ds   # Disposition
 ```
 
-The DM structure matters most — everything else joins back to it:
+The DM structure matters most — everything else joins back to it.
 
+**In SAS:**
+```sas
+/* Inspect structure of a SAS dataset */
+PROC CONTENTS DATA=dm;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 glimpse(dm)
+# or:
+str(dm)
 ```
 
 Key fields:
@@ -60,6 +70,15 @@ class(dm$RFSTDTC)
 # [1] "character"
 ```
 
+**Date type comparison:**
+
+| | SAS | R |
+|-|-----|---|
+| Storage | Numeric (days since **1960-01-01**) | `Date` class (days since **1970-01-01**) |
+| SDTM representation | ISO8601 character `"2014-01-02"` | ISO8601 character `"2014-01-02"` |
+| Conversion | `INPUT(dtc, YYMMDD10.)` | `as.Date(dtc)` |
+| Missing | `.` | `NA` |
+
 To do date arithmetic, convert:
 
 ```r
@@ -68,6 +87,23 @@ as.Date(dm$RFSTDTC[1:3])
 ```
 
 Partial dates are the complication: `"2014-03"` has no day. `as.Date("2014-03")` returns `NA`. CDISC defines imputation rules for this — Chapter 4 handles it properly with `admiral::derive_vars_dt()`.
+
+---
+
+## Printing the First Few Rows
+
+**In SAS:**
+```sas
+PROC PRINT DATA=ae(OBS=5);
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+head(ae, 5)
+# or:
+print(ae)   # tibbles auto-truncate to 10 rows
+```
 
 ---
 
@@ -86,13 +122,32 @@ unique(dm$ACTARM)
 unique(ae$AESER)
 ```
 
-Validate `SEX` — the simplest CT check:
+**In SAS**, CT compliance is often checked using SAS formats:
+```sas
+/* Defining CT as a SAS format */
+PROC FORMAT;
+  VALUE $SEXFMT
+    'M' = 'Male'
+    'F' = 'Female'
+    'U' = 'Unknown'
+    OTHER = 'INVALID';
+RUN;
 
+/* Using it to check */
+PROC FREQ DATA=dm;
+  TABLES SEX;
+  FORMAT SEX $SEXFMT.;
+RUN;
+```
+
+**In R (pharmaverse)**, CT values are just character constants — validation is explicit code:
 ```r
 allowed_sex <- c("M", "F", "U", "UNDIFFERENTIATED")
 bad_sex <- dm %>% filter(!SEX %in% allowed_sex)
 nrow(bad_sex)   # should be 0
 ```
+
+> ⚠️ **Case sensitivity:** SAS formats match case-insensitively. `"Male"` would match `'M'` in a well-written SAS format. In R, `"Male"` does **not** equal `"M"` — the comparison is exact. SDTM requires uppercase CT values; always verify.
 
 If it's not zero, you have a problem. In real data, you'd see things like `"Male"`, `"MALE"`, `"male"` — all wrong.
 

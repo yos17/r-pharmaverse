@@ -43,6 +43,25 @@ adsl_ref <- pharmaverseadam::adsl
 
 Last chapter gave us `TRTSDT` and `TRTEDT`. Now we add the structure:
 
+**In SAS:**
+```sas
+DATA adsl;
+  SET dm(WHERE=(ACTARM NE "Screen Failure")
+         KEEP=STUDYID USUBJID SUBJID SITEID
+              RFICDTC RFSTDTC RFENDTC RFXSTDTC RFXENDTC
+              DTHDTC DTHFL AGE AGEU SEX RACE ETHNIC
+              ARMCD ARM ACTARMCD ACTARM COUNTRY);
+  TRT01P  = ACTARM;
+  TRT01A  = ACTARM;
+  /* numeric codes must be assigned manually */
+  IF      ACTARM = "Drug A"  THEN TRT01PN = 1;
+  ELSE IF ACTARM = "Drug B"  THEN TRT01PN = 2;
+  ELSE IF ACTARM = "Placebo" THEN TRT01PN = 3;
+  TRT01AN = TRT01PN;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 adsl <- dm %>%
   filter(ACTARM != "Screen Failure") %>%
@@ -82,12 +101,51 @@ adsl <- adsl %>%
   )
 ```
 
+**SAS equivalent for treatment duration:**
+```sas
+TRTDURD = TRTEDT - TRTSDT + 1;
+/* SAS date arithmetic is identical — both are integer days */
+```
+
+> **Note:** Date subtraction is the same in SAS and R — both give integer days. The `+ 1` convention for inclusive duration is identical.
+
 ---
 
 ## Step 3: Demographics Subgroups
 
 The SAP requires `AGEGR1` for the age group row in Table 14.1.1. Add numeric versions for sorting:
 
+**In SAS:**
+```sas
+DATA adsl;
+  SET adsl;
+  /* Age groups */
+  IF      AGE < 18              THEN AGEGR1 = "<18";
+  ELSE IF AGE >= 18 AND AGE < 40 THEN AGEGR1 = "18-39";
+  ELSE IF AGE >= 40 AND AGE < 65 THEN AGEGR1 = "40-64";
+  ELSE IF AGE >= 65              THEN AGEGR1 = ">=65";
+
+  IF      AGEGR1 = "<18"   THEN AGEGR1N = 1;
+  ELSE IF AGEGR1 = "18-39" THEN AGEGR1N = 2;
+  ELSE IF AGEGR1 = "40-64" THEN AGEGR1N = 3;
+  ELSE IF AGEGR1 = ">=65"  THEN AGEGR1N = 4;
+
+  /* Sex numeric */
+  IF      SEX = "M" THEN SEXN = 1;
+  ELSE IF SEX = "F" THEN SEXN = 2;
+
+  /* Race numeric */
+  IF      RACE = "WHITE"                             THEN RACEN = 1;
+  ELSE IF RACE = "BLACK OR AFRICAN AMERICAN"         THEN RACEN = 2;
+  ELSE IF RACE = "ASIAN"                             THEN RACEN = 3;
+  ELSE IF RACE = "AMERICAN INDIAN OR ALASKA NATIVE"  THEN RACEN = 4;
+  ELSE IF RACE = "MULTIPLE"                          THEN RACEN = 6;
+  ELSE IF RACE = "UNKNOWN"                           THEN RACEN = 7;
+  ELSE                                                    RACEN = 99;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 adsl <- adsl %>%
   mutate(
@@ -121,12 +179,49 @@ adsl <- adsl %>%
   )
 ```
 
+> **Tip:** `case_when()` is the R equivalent of a series of `IF-THEN-ELSE` statements in a SAS DATA step. The `TRUE ~` at the end is the `ELSE` clause. Unlike SAS, which sets remaining conditions to missing by default, you must explicitly handle the else case in R.
+
 ---
 
 ## Step 4: Disposition and Completion
 
 The SAP requires `COMPLFL` and `EOSSTT`. These come from the DS domain.
 
+**In SAS:**
+```sas
+/* Get last disposition record per subject */
+PROC SORT DATA=ds OUT=ds_sorted;
+  BY USUBJID DSSTDTC;
+RUN;
+
+DATA ds_last;
+  SET ds_sorted;
+  BY USUBJID;
+  IF LAST.USUBJID;   /* LAST. is the SAS BY-group idiom */
+  KEEP USUBJID DSDECOD DSSTDTC;
+RUN;
+
+/* Merge into ADSL */
+PROC SORT DATA=adsl;    BY USUBJID; RUN;
+PROC SORT DATA=ds_last; BY USUBJID; RUN;
+
+DATA adsl;
+  MERGE adsl(IN=inADSL) ds_last(IN=inDS KEEP=USUBJID DSDECOD);
+  BY USUBJID;
+  IF inADSL;   /* keep all ADSL subjects */
+
+  IF      DSDECOD = "COMPLETED"                          THEN COMPLFL = "Y";
+  ELSE                                                        COMPLFL = "N";
+
+  IF      DSDECOD = "COMPLETED"                          THEN EOSSTT = "COMPLETED";
+  ELSE IF INDEX(DSDECOD, "WITHDRAWAL") OR
+          DSDECOD IN ("DEATH", "LOST TO FOLLOW-UP")      THEN EOSSTT = "DISCONTINUED";
+  ELSE IF MISSING(DSDECOD)                               THEN EOSSTT = "ONGOING";
+  ELSE                                                        EOSSTT = "DISCONTINUED";
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 # Get each subject's last disposition record
 ds_last <- ds %>%
@@ -149,12 +244,39 @@ adsl <- adsl %>%
   )
 ```
 
+> **`FIRST.` / `LAST.` in BY-groups:** The SAS BY-group idiom (`IF LAST.USUBJID`) has no direct R equivalent. The R pattern is `group_by(USUBJID) %>% slice_tail(n=1)` (for last) or `slice_head(n=1)` (for first). Remember to `ungroup()` afterward.
+
 ---
 
 ## Step 5: Analysis Flags
 
 The SAP defines three analysis populations. Each flag is derived from explicit rules.
 
+**In SAS:**
+```sas
+/* Get dosed subjects from EX */
+PROC SORT DATA=ex OUT=ex_unique NODUPKEY;
+  BY USUBJID;
+RUN;
+
+DATA adsl;
+  MERGE adsl(IN=inADSL) ex_unique(IN=inEX KEEP=USUBJID EXSTDTC);
+  BY USUBJID;
+  IF inADSL;
+
+  /* Some companies use a macro: %POPFLAG(DOSED=inEX, ...) */
+  ITTFL   = "Y";  /* all enrolled */
+  IF inEX AND NOT MISSING(EXSTDTC) THEN SAFFL = "Y";
+  ELSE SAFFL = "N";
+
+  IF SAFFL = "Y" AND COMPLFL = "Y" THEN PPROTFL = "Y";
+  ELSE PPROTFL = "N";
+
+  DROP EXSTDTC;
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 # Which subjects received at least one dose?
 ex_dosed <- ex %>%
@@ -171,6 +293,8 @@ adsl <- adsl %>%
   ) %>%
   select(-DOSED)
 ```
+
+> **Flag derivation:** In SAS, `IF condition THEN flag = "Y"; ELSE flag = "N";` is the pattern. In R, `if_else(condition, "Y", "N")` is the direct equivalent. For complex logic with multiple conditions, `case_when()` replaces the multi-branch `IF-THEN-ELSE` chain.
 
 ---
 
@@ -202,7 +326,31 @@ adsl <- adsl %>%
 
 ## Step 7: Labels
 
-In SAS, labels are in the dataset. In R, they're attributes. Use `labelled`:
+**In SAS:**
+```sas
+DATA adsl;
+  SET adsl;
+  LABEL
+    USUBJID  = "Unique Subject Identifier"
+    TRT01P   = "Planned Treatment for Period 01"
+    TRT01A   = "Actual Treatment for Period 01"
+    TRTSDT   = "Date of First Exposure to Treatment"
+    TRTEDT   = "Date of Last Exposure to Treatment"
+    TRTDURD  = "Total Treatment Duration (Days)"
+    AGE      = "Age"
+    AGEGR1   = "Pooled Age Group 1"
+    SEX      = "Sex"
+    RACE     = "Race"
+    ITTFL    = "Intent-To-Treat Population Flag"
+    SAFFL    = "Safety Population Flag"
+    PPROTFL  = "Per-Protocol Population Flag"
+    COMPLFL  = "Completers Population Flag";
+RUN;
+```
+
+**In R (pharmaverse):**
+
+In SAS, labels are native and visible in `PROC CONTENTS`. In R, they're stored as attributes via the `labelled` package:
 
 ```r
 library(labelled)
@@ -224,6 +372,19 @@ adsl <- adsl %>%
     PPROTFL  = "Per-Protocol Population Flag",
     COMPLFL  = "Completers Population Flag"
   )
+```
+
+To check labels (equivalent to `PROC CONTENTS`):
+
+```r
+# See all labels
+labelled::var_label(adsl)
+
+# Single variable
+attr(adsl$USUBJID, "label")
+
+# Dataset structure with labels
+str(adsl)
 ```
 
 ---
@@ -342,6 +503,17 @@ for (fl in c("ITTFL","SAFFL","PPROTFL","COMPLFL")) {
 
 ## QC: What If Your ADSL Disagrees with Reference?
 
+**In SAS:**
+```sas
+PROC COMPARE DATA=adsl_mine COMPARE=adsl_ref;
+  ID USUBJID;
+  VAR TRTSDT TRTEDT TRTDURD AGEGR1 SAFFL;
+RUN;
+/* PROC COMPARE with LISTALL LISTVAR shows every difference */
+/* CRITERION=1E-6 for numeric tolerance */
+```
+
+**In R (pharmaverse):**
 ```r
 library(diffdf)
 

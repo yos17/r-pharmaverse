@@ -31,6 +31,22 @@ The AE table uses this exactly. What changes: the row layout. Instead of `analyz
 
 ## The AE Table Layout
 
+**In SAS:**
+```sas
+PROC REPORT DATA=adae_teae NOWD;
+  COLUMN TRT01A, (USUBJID n pct)
+         AEBODSYS AEDECOD;
+  DEFINE TRT01A  / ACROSS;
+  DEFINE USUBJID / COMPUTED;
+  DEFINE n       / COMPUTED "n";
+  DEFINE pct     / COMPUTED "(%)";
+  DEFINE AEBODSYS / "System Organ Class" GROUP ORDER=INTERNAL;
+  DEFINE AEDECOD  / "Preferred Term"     DISPLAY;
+  /* Denominator must be computed manually or using macro */
+RUN;
+```
+
+**In R (pharmaverse — rtables/tern):**
 ```r
 library(rtables)
 library(tern)
@@ -85,12 +101,28 @@ ae_table
 
 The key detail: `alt_counts_df`. The denominator for percentages should be the safety population (N per arm), not the number of AE records. This is a common source of errors — without `alt_counts_df`, percentages would be wrong.
 
+> **SAS equivalent:** In SAS you'd control the denominator with `DENOM=` in `PROC FREQ`, or compute it manually in a `PROC REPORT` compute block. The `alt_counts_df` argument in `build_table()` is the clean R equivalent.
+
 ---
 
 ## Sort by Frequency
 
-Regulatory tables sort SOCs by descending subject count:
+**In SAS:**
+```sas
+/* Sort by descending count — requires pre-processing */
+PROC FREQ DATA=adae_teae;
+  TABLES AEBODSYS / OUT=soc_counts;
+RUN;
 
+PROC SORT DATA=soc_counts;
+  BY DESCENDING COUNT;
+RUN;
+/* Then use a format or merge to impose sort order in PROC REPORT */
+```
+
+**In R (pharmaverse):**
+
+Regulatory tables sort SOCs by descending subject count:
 ```r
 ae_table_sorted <- ae_table %>%
   sort_at_path(
@@ -156,6 +188,24 @@ cat("Saved: output/t14_3_1.txt\n")
 
 ## ARDs: The Cleaner Approach
 
+In SAS, output from `PROC MEANS` or `PROC FREQ` can be written to datasets — these are essentially manual ARDs (Analysis Results Datasets):
+
+**In SAS (manual ARD approach):**
+```sas
+/* ODS OUTPUT captures PROC output to a dataset */
+ODS OUTPUT Summary = ard_age;
+PROC MEANS DATA=adsl_safe N MEAN STD;
+  CLASS TRT01A;
+  VAR AGE;
+RUN;
+
+ODS OUTPUT CrossTabFreqs = ard_sex;
+PROC FREQ DATA=adsl_safe;
+  TABLES TRT01A * SEX / NOCUM;
+RUN;
+/* These "ARD-like" datasets can be combined, but there's no standard format */
+```
+
 The `rtables` approach computes statistics and formats them in one step. The ARD approach separates them:
 
 ```
@@ -164,6 +214,7 @@ ADaM → {cards} → ARD (statistics stored as tidy data) → {tfrmt} → format
 
 This matters when you need to reuse statistics across multiple outputs — e.g., the same age mean in both a table and a report.
 
+**In R (pharmaverse — cards):**
 ```r
 library(cards)
 library(pharmaverseadam)
@@ -172,6 +223,7 @@ library(dplyr)
 adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
 
 # Build ARD: one row per statistic per group
+# Equivalent to: ODS OUTPUT Summary=ard_age; PROC MEANS ... ; RUN;
 ard_age <- ard_continuous(
   data      = adsl_safe,
   variables = AGE,
@@ -196,6 +248,57 @@ ard_demo %>%
 ```
 
 The ARD is a tidy data frame — one row per statistic. You can inspect it, export it, pass it to `tfrmt` for formatting.
+
+---
+
+## tfrmt: Format Templates vs. PUT Formats
+
+**In SAS**, number formatting uses `PUT` statements or `FORMAT` attributes:
+```sas
+/* SAS: format specification at display time */
+PUT mean 8.1;          /* 8 total width, 1 decimal */
+PUT pct 5.1;           /* 5 total width, 1 decimal */
+
+/* In PROC REPORT: */
+DEFINE mean / FORMAT=8.1;
+DEFINE pct  / FORMAT=5.1;
+```
+
+**In R (pharmaverse — tfrmt):**
+```r
+library(tfrmt)
+
+# tfrmt format spec: like a PROC REPORT template
+fmt_spec <- tfrmt(
+  # Column structure
+  group    = vars(TRT01A),
+  label    = vars(label),
+  param    = vars(stat_name),
+  value    = vars(stat),
+
+  # Row formatting — like PUT formats in SAS
+  body_plan = body_plan(
+    frmt_structure(
+      group_val = ".default",
+      label_val = ".default",
+      frmt_combine("{mean} ({sd})",
+        mean = frmt("xx.x"),   # like PUT mean 8.1
+        sd   = frmt("xx.xx")   # like PUT std 8.2
+      )
+    )
+  )
+)
+
+# Apply format to ARD
+print_to_gt(fmt_spec, .data = ard_demo)
+```
+
+| SAS | tfrmt |
+|-----|-------|
+| `PUT mean 8.1` | `frmt("xx.x")` |
+| `PUT pct 5.1;` | `frmt("xx.x%")` |
+| `PROC REPORT` with `FORMAT=` | `body_plan()` with `frmt_structure()` |
+| `ODS OUTPUT Summary=ard;` | `cards::ard_continuous()` |
 
 ---
 

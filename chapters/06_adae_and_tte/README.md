@@ -28,6 +28,23 @@ ADAE extends the SDTM AE domain with all of these.
 
 ## Step 1: Merge ADSL Variables
 
+**In SAS:**
+```sas
+/* Sort both datasets first */
+PROC SORT DATA=ae;    BY STUDYID USUBJID; RUN;
+PROC SORT DATA=adsl;  BY STUDYID USUBJID; RUN;
+
+DATA adae;
+  MERGE ae(IN=inAE)
+        adsl(IN=inADSL
+             KEEP=STUDYID USUBJID TRTSDT TRTEDT
+                  TRT01A TRT01AN SAFFL AGE SEX RACE);
+  BY STUDYID USUBJID;
+  IF inAE;   /* one row per AE, gets ADSL variables */
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 library(admiral)
 library(pharmaversesdtm)
@@ -48,6 +65,26 @@ adae <- ae %>%
 ---
 
 ## Step 2: Analysis Dates
+
+**In SAS:**
+```sas
+DATA adae;
+  SET adae;
+  /* Start date */
+  IF LENGTH(TRIM(AESTDTC)) = 10 THEN
+    ASTDT = INPUT(AESTDTC, YYMMDD10.);
+  ELSE IF LENGTH(TRIM(AESTDTC)) = 7 THEN
+    ASTDT = INPUT(CATS(AESTDTC, "-01"), YYMMDD10.);  /* impute to first */
+  FORMAT ASTDT DATE9.;
+
+  /* Study day — CDISC convention: no day 0 */
+  IF ASTDT >= TRTSDT THEN ASTDY =  ASTDT - TRTSDT + 1;
+  ELSE IF NOT MISSING(ASTDT) AND NOT MISSING(TRTSDT)
+                     THEN ASTDY =  ASTDT - TRTSDT;
+RUN;
+```
+
+**In R (pharmaverse — admiral):**
 
 Convert ISO8601 `AESTDTC` / `AEENDTC` to Date, then compute study days:
 
@@ -73,6 +110,28 @@ adae <- adae %>%
 ---
 
 ## Step 3: Treatment-Emergent Flag
+
+**In SAS (naive approach):**
+```sas
+DATA adae;
+  SET adae;
+  /* Naive: starts on or after treatment start */
+  IF NOT MISSING(ASTDT) AND NOT MISSING(TRTSDT) AND
+     ASTDT >= TRTSDT THEN TRTEMFL = "Y";
+  /* This misses: AEs starting >30 days after last dose */
+RUN;
+```
+
+**In SAS (SAP-compliant, 30-day window):**
+```sas
+DATA adae;
+  SET adae;
+  IF NOT MISSING(ASTDT) AND NOT MISSING(TRTSDT) AND
+     ASTDT >= TRTSDT AND
+     (MISSING(TRTEDT) OR ASTDT <= TRTEDT + 30)
+  THEN TRTEMFL = "Y";
+RUN;
+```
 
 An AE is treatment-emergent if it starts on or after the first dose date:
 
@@ -111,6 +170,7 @@ adae <- adae %>%
 
 Admiral provides `derive_var_trtemfl()` which implements this with parameter control:
 
+**In R (pharmaverse — admiral):**
 ```r
 adae <- adae %>%
   derive_var_trtemfl(
@@ -125,8 +185,42 @@ adae <- adae %>%
 
 ## Step 4: Worst Severity Flag
 
-For each subject, flag the worst (most severe) AE. For each subject+PT, flag the worst:
+**In SAS:**
+```sas
+/* Numeric severity for sorting */
+DATA adae;
+  SET adae;
+  IF      AESEV = "MILD"     THEN ASEVN = 1;
+  ELSE IF AESEV = "MODERATE" THEN ASEVN = 2;
+  ELSE IF AESEV = "SEVERE"   THEN ASEVN = 3;
+RUN;
 
+/* Worst per subject — PROC SORT + FIRST/LAST pattern */
+PROC SORT DATA=adae OUT=adae_sev;
+  BY USUBJID DESCENDING ASEVN ASTDT;
+RUN;
+
+DATA adae;
+  SET adae_sev;
+  BY USUBJID;
+  IF FIRST.USUBJID THEN AOCCIFL = "Y";  /* worst = first after sort */
+  ELSE AOCCIFL = "";
+RUN;
+
+/* Worst per subject per PT */
+PROC SORT DATA=adae OUT=adae_pt;
+  BY USUBJID AEDECOD DESCENDING ASEVN ASTDT;
+RUN;
+
+DATA adae;
+  SET adae_pt;
+  BY USUBJID AEDECOD;
+  IF FIRST.AEDECOD THEN AOCCPIFL = "Y";
+  ELSE AOCCPIFL = "";
+RUN;
+```
+
+**In R (pharmaverse — admiral):**
 ```r
 adae <- adae %>%
   mutate(
@@ -152,6 +246,8 @@ adae <- adae %>%
     mode    = "first"
   )
 ```
+
+> **The PROC SORT + FIRST./LAST. pattern** is one of the most common SAS idioms. Admiral's `derive_var_extreme_flag()` replaces this entire pattern: no sorting needed first, no BY-group logic, no risk of forgetting to restore sort order.
 
 ---
 
@@ -216,6 +312,11 @@ adae <- adae %>%
     mode    = "first"
   )
 
+# ---- Sorting ----
+adae <- adae %>%
+  arrange(USUBJID, ASTDT)
+# In SAS: PROC SORT DATA=adae BY USUBJID AESTDTC; RUN;
+
 # ---- QC summary ----
 n_safety <- sum(adsl$SAFFL == "Y", na.rm = TRUE)
 teae     <- adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
@@ -265,6 +366,31 @@ adtte_ttae <- adsl %>%
     EVNTDESC = if_else(CNSR == 0L, "Adverse Event Occurred", ""),
     CNSDTDSC = if_else(CNSR == 1L, "End of Treatment", "")
   )
+```
+
+---
+
+## Sequence Numbers
+
+**In SAS:**
+```sas
+/* Sequence number per subject — the RETAIN + sum statement pattern */
+DATA adae;
+  SET adae;
+  BY USUBJID;
+  RETAIN AESEQ 0;
+  IF FIRST.USUBJID THEN AESEQ = 0;
+  AESEQ + 1;
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+adae <- adae %>%
+  arrange(USUBJID, ASTDT) %>%
+  group_by(USUBJID) %>%
+  mutate(AESEQ = row_number()) %>%
+  ungroup()
 ```
 
 ---

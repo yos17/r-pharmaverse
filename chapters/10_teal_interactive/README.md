@@ -33,6 +33,24 @@ library(dplyr)
 
 ---
 
+## No Direct SAS Equivalent — But Here's the Closest
+
+SAS does not have a direct equivalent to `teal`. The closest SAS tools are:
+
+| What teal provides | SAS equivalent / approximation |
+|-------------------|-------------------------------|
+| Interactive table explorer | SAS Visual Analytics (VA) / JMP |
+| On-demand `PROC REPORT` | Manual re-running of programs |
+| Dynamic `WHERE` clause across all analyses | Re-running with `WHERE` in each program |
+| KM plot on filtered subset | `PROC LIFETEST` re-run |
+| Point-and-click subgroup analysis | SAS Enterprise Guide / SAS Studio |
+
+**The key conceptual insight:** `teal` is what you build when you want an interactive, browser-based version of all your `PROC REPORT` outputs in one place. Instead of running 10 SAS programs to check results for the female subgroup, you change one filter in teal and all tables update simultaneously.
+
+The **filter panel** = a dynamic `WHERE` clause applied to **all** analyses simultaneously — something that would require re-running every SAS program manually.
+
+---
+
 ## Start with One Module
 
 Don't build the full app first. Start with one module.
@@ -236,6 +254,8 @@ The filter panel is teal's key feature. Users can filter across all modules simu
 ```
 
 Filters propagate automatically — if you filter to females only in the panel, every table and plot updates. This replaces the manual re-running of SAS programs for subgroup reviews.
+
+> **SAS mental model:** Imagine adding `WHERE SEX = "F"` to every single SAS program — `PROC REPORT`, `PROC LIFETEST`, `PROC MEANS` — and re-running them all. That's what you do in SAS for a subgroup review. In teal, you change the filter panel once and everything updates instantly.
 
 ---
 

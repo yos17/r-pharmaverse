@@ -40,7 +40,30 @@ Raw data looks like what comes out of EDC — messy column names, non-CT values,
 
 ## The Naive Approach (and Why It Breaks)
 
-You might write:
+**In SAS**, a SDTM mapping looks like this:
+
+```sas
+DATA dm;
+  SET raw_dm;
+  DOMAIN = "DM";
+
+  /* CT mapping — written by hand each study */
+  IF UPCASE(GENDER) = "MALE"   THEN SEX = "M";
+  ELSE IF UPCASE(GENDER) = "FEMALE" THEN SEX = "F";
+  ELSE SEX = "";  /* unmapped values become blank */
+
+  /* Date conversion from EDC format to ISO8601 */
+  IF INDEX(RFICDTC, "T") > 0 THEN
+    RFICDTC_DT = INPUT(SUBSTR(RFICDTC, 1, 10), YYMMDD10.);
+  ELSE
+    RFICDTC_DT = INPUT(RFICDTC, YYMMDD10.);
+  FORMAT RFICDTC_DT DATE9.;
+
+  USUBJID = CATS(STUDYID, "-", SITEID, "-", SUBJID);
+RUN;
+```
+
+**In R (naive approach):**
 
 ```r
 dm_naive <- raw_dm %>%
@@ -54,9 +77,11 @@ dm_naive <- raw_dm %>%
   )
 ```
 
-This works for this dataset. But what about the next study where raw values are `"MALE"`, `"male"`, `"1"`, `"2"`? And the study after that? You'd rewrite the `case_when` every time, and every programmer would write a slightly different version.
+Both approaches work for this dataset. But what about the next study where raw values are `"MALE"`, `"male"`, `"1"`, `"2"`? You'd rewrite the mapping every time, and every programmer would write a slightly different version.
 
 This is the problem `sdtm.oak` solves.
+
+> ⚠️ **Key difference:** SAS `UPCASE(GENDER) = "MALE"` handles case variations automatically. In R, `GENDER == "Male"` only matches that exact case — `"MALE"` and `"male"` would fall through to `NA`. The `sdtm.oak` `assign_ct()` function uses standardised CDISC codelists that handle these variations consistently.
 
 ---
 
@@ -80,6 +105,15 @@ The key insight: CT mapping uses CDISC NCI codelist C-codes, not hand-coded `cas
 
 Start simple. `DOMAIN` is always hard-coded:
 
+**In SAS:**
+```sas
+DATA dm;
+  SET raw_dm;
+  DOMAIN = "DM";
+RUN;
+```
+
+**In R (pharmaverse — sdtm.oak):**
 ```r
 library(sdtm.oak)
 library(pharmaverseraw)
@@ -106,6 +140,23 @@ table(dm$DOMAIN)   # should be all "DM"
 
 Now the interesting part. Load the CT spec and use `assign_ct()`:
 
+**In SAS:**
+```sas
+PROC FORMAT;
+  VALUE $SEXCT
+    'Male'   = 'M'
+    'Female' = 'F'
+    OTHER    = ' ';   /* unmapped → blank (easy to miss!) */
+RUN;
+
+DATA dm;
+  SET raw_dm;
+  SEX = PUT(GENDER, $SEXCT.);
+  /* Problem: blanks are silently wrong; no audit trail of unmapped values */
+RUN;
+```
+
+**In R (pharmaverse — sdtm.oak):**
 ```r
 ct <- sdtm.oak::ct_spec_example("ct-01-prog")
 
@@ -217,6 +268,8 @@ dm %>% filter(is.na(SEX)) %>% select(USUBJID) %>%
   left_join(raw_dm %>% select(USUBJID, GENDER), by = "USUBJID")
 # Shows: USUBJID + the raw GENDER value that failed
 ```
+
+In SAS, an unmapped `PUT()` format returns blank — which looks like a valid missing value and hides the problem.
 
 ### NCI CT Codelist C-codes
 

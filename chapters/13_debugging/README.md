@@ -17,6 +17,27 @@ You know there are 3 bugs. You don't know exactly where the code is wrong. Let's
 
 ---
 
+## Debugging Mindset: SAS vs. R
+
+In SAS, debugging usually means:
+1. Looking at the `.log` for `ERROR:` and `WARNING:` messages
+2. Adding `%PUT` statements to print variable values
+3. Using `PROC PRINT` with `WHERE` to inspect specific observations
+4. Running `PROC COMPARE` to find differences between datasets
+
+In R, the toolkit is different but the strategy is identical: isolate where the data goes wrong, inspect values at that point.
+
+| SAS | R |
+|-----|---|
+| Check `.log` for ERRORs | Check console errors / warnings |
+| `%PUT &myvar;` | `cat(myvar, "\n")` / `print(myvar)` |
+| `PROC PRINT DATA=adsl(WHERE=(USUBJID="01-701-1015") OBS=1);` | `adsl %>% filter(USUBJID=="01-701-1015") %>% print()` |
+| `PROC COMPARE DATA=mine COMPARE=ref;` | `diffdf(base=mine, compare=ref, keys="USUBJID")` |
+| `%PUT _ALL_;` in macro | `ls()` inside `browser()` |
+| SAS debugger (rarely used) | `browser()` — powerful, interactive |
+
+---
+
 ## Setup: The Buggy ADSL
 
 ```r
@@ -66,8 +87,25 @@ adsl_buggy <- dm_buggy %>%
 
 ---
 
-## Step 1: diffdf to Locate the Bugs
+## Step 1: diffdf / PROC COMPARE to Locate the Bugs
 
+**In SAS:**
+```sas
+/* Sort both datasets first */
+PROC SORT DATA=adsl_buggy;  BY USUBJID; RUN;
+PROC SORT DATA=adsl_ref;    BY USUBJID; RUN;
+
+PROC COMPARE DATA=adsl_buggy COMPARE=adsl_ref LISTALL LISTVAR;
+  ID USUBJID;
+  /* Output shows:
+     Variable    Number of Differences
+     TRTEDT      2
+     TRTDURD     2
+     AGEGR1      1  */
+RUN;
+```
+
+**In R (pharmaverse — diffdf):**
 ```r
 library(diffdf)
 
@@ -109,9 +147,23 @@ diff_result$VarDiff_AGEGR1 %>%
 
 ---
 
-## Step 2: browser() to Trace Bug 1
+## Step 2: Inspecting Specific Subjects
 
-Now we know subject `01-701-1015` has wrong `TRTEDT`. Use `browser()` to inspect the data at the moment `TRTEDT` is derived:
+**In SAS:**
+```sas
+/* Inspect specific subject — SAS PROC PRINT with WHERE */
+PROC PRINT DATA=adsl_buggy(WHERE=(USUBJID = "01-701-1015") OBS=1);
+  VAR USUBJID RFXSTDTC RFXENDTC TRTSDT TRTEDT;
+RUN;
+/* Also inspect raw source data */
+PROC PRINT DATA=dm_buggy(WHERE=(USUBJID = "01-701-1015") OBS=1);
+  VAR USUBJID RFXSTDTC RFXENDTC;
+RUN;
+```
+
+**In R (pharmaverse):**
+
+Now we know subject `01-701-1015` has wrong `TRTEDT`. Use `filter()` to inspect the data at the moment `TRTEDT` is derived:
 
 ```r
 # Break the pipe at the suspect step
@@ -142,6 +194,19 @@ Output:
 
 `diffdf` showed a second subject with wrong `TRTEDT`. That comes from using `"first"` imputation for end dates:
 
+**In SAS (equivalent investigation):**
+```sas
+/* Find partial dates in RFXENDTC */
+DATA check;
+  SET dm_buggy;
+  len = LENGTH(TRIM(RFXENDTC));
+  IF len = 7;   /* YYYY-MM only — partial date */
+  KEEP USUBJID RFXENDTC len;
+RUN;
+PROC PRINT DATA=check; RUN;
+```
+
+**In R:**
 ```r
 # Show subjects with partial RFXENDTC (missing day)
 dm_buggy %>%
@@ -155,6 +220,27 @@ If subject `01-701-1023` has a partial end date `"2014-03"`, then:
 - `date_imputation = "last"` → `2014-03-31`
 
 The SAP says end dates use last-of-month imputation. Fix: change `"first"` to `"last"` in `derive_vars_dt(new_vars_prefix = "TRTE", ...)`.
+
+### browser() for Interactive Inspection
+
+In R you can also pause execution mid-pipe and inspect interactively:
+
+```r
+# Pause inside a pipe — no SAS equivalent!
+adsl <- dm_buggy %>%
+  filter(ACTARM != "Screen Failure") %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC) %>%
+  { browser(); . } %>%        # pause here — . is the data so far
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC)
+  # At the browser() prompt:
+  # - Type . to see the data
+  # - filter(., USUBJID=="01-701-1023") %>% select(RFXENDTC) to inspect
+  # - ls() to list objects in scope
+  # - n to step forward
+  # - Q to quit
+```
+
+> **No SAS equivalent for `browser()`:** SAS has no interactive mid-execution debugger. The closest approach in SAS is a `%PUT` statement after each step, then re-running. R's `browser()` lets you pause at any point, inspect the environment, and continue without re-running from scratch.
 
 ---
 
@@ -176,6 +262,18 @@ adsl_buggy %>%
 # Subject aged exactly 65 falls into "40-64" (because 65 < 65 is FALSE → AGE > 65 is FALSE)
 ```
 
+**In SAS this is equivalent to:**
+```sas
+/* The SAS bug would look like: */
+ELSE IF AGE > 65 THEN AGEGR1 = ">=65";  /* should be >= 65 */
+
+/* To find it:
+PROC FREQ DATA=adsl_buggy;
+  TABLES AGE * AGEGR1 / LIST;
+  WHERE AGE IN (39, 40, 64, 65, 66);   /* check boundary ages */
+RUN;
+```
+
 This is the most common age-group bug. Always use `>=` not `>` for the upper boundary.
 
 Fix:
@@ -186,84 +284,6 @@ AGEGR1 = case_when(
   AGE >= 65             ~ ">=65",   # fixed: >= not >
   TRUE                  ~ NA_character_
 )
-```
-
----
-
-## Debugging Techniques for the Pipeline
-
-### Technique 1: Break the Pipe
-
-```r
-# This crashes somewhere — where?
-adsl <- dm %>%
-  filter(ACTARM != "Screen Failure") %>%
-  derive_vars_dt(...) %>%
-  left_join(ex_derived, by="USUBJID") %>%
-  mutate(SAFFL = if_else(dosed, "Y", "N"))
-
-# Break it:
-step1 <- dm %>% filter(ACTARM != "Screen Failure")
-step2 <- step1 %>% derive_vars_dt(...)
-step3 <- step2 %>% left_join(ex_derived, by="USUBJID")
-# Check nrow() at each step — find where rows change unexpectedly
-```
-
-### Technique 2: Mid-Pipe browser()
-
-```r
-adsl <- dm %>%
-  filter(ACTARM != "Screen Failure") %>%
-  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC) %>%
-  { browser(); . } %>%        # pause here, . is the data
-  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC)
-```
-
-At the `browser()` prompt: type `.` to see the data, `ls()` to list objects, `n` to step forward.
-
-### Technique 3: The Join Row Explosion
-
-You have 254 subjects. After a `left_join`, you suddenly have 800 rows. This is the #1 silent bug.
-
-```r
-# Danger: ex has multiple rows per subject
-adsl %>% left_join(ex, by = "USUBJID")   # 254 × avg 4 doses = ~800 rows!
-```
-
-**Diagnose:**
-```r
-ex %>% count(USUBJID) %>% filter(n > 1)
-# Shows every subject with multiple EX records
-```
-
-**Fix: always aggregate before joining**
-```r
-ex_first_dose <- ex %>%
-  mutate(EXSTDT = as.Date(substr(EXSTDTC, 1, 10))) %>%
-  group_by(USUBJID) %>%
-  summarise(EXSTDT_FIRST = min(EXSTDT, na.rm = TRUE), .groups = "drop")
-# Now ex_first_dose has one row per subject — safe to join
-
-adsl %>% left_join(ex_first_dose, by = "USUBJID")
-```
-
-**Safe join wrapper — crashes loudly if rows change:**
-
-```r
-safe_join <- function(left, right, by, type = "left") {
-  n_before <- nrow(left)
-  result <- switch(type,
-    left  = left_join(left, right, by = by),
-    inner = inner_join(left, right, by = by)
-  )
-  n_after <- nrow(result)
-  if (n_after != n_before)
-    stop(sprintf(
-      "Join on '%s' changed row count: %d → %d (+%d). Right side not unique!",
-      paste(by, collapse=", "), n_before, n_after, n_after - n_before
-    ))
-  result
-}
 ```
 
 ---
@@ -306,7 +326,7 @@ adsl_buggy <- dm_buggy %>%
 
 adsl_ref <- pharmaverseadam::adsl
 
-# ---- Step 1: diffdf ----
+# ---- Step 1: diffdf (equivalent to PROC COMPARE) ----
 cat("=== PHARM-001 ADSL Bug Hunt ===\n\n")
 diff_result <- diffdf(base = adsl_buggy, compare = adsl_ref, keys = "USUBJID")
 
@@ -339,6 +359,7 @@ for (var in unique(diff_result$NumDiff$Variable)) {
 cat("\n--- TRTEDT: inspect source data for discrepant subjects ---\n")
 if ("VarDiff_TRTEDT" %in% names(diff_result)) {
   bad_ids <- diff_result$VarDiff_TRTEDT$USUBJID
+  # Equivalent to: PROC PRINT DATA=dm_buggy(WHERE=(USUBJID IN (&bad_ids)));
   dm_buggy %>%
     filter(USUBJID %in% bad_ids) %>%
     select(USUBJID, RFXSTDTC, RFXENDTC) %>%
@@ -363,6 +384,115 @@ cat("Bug 1: RFXENDTC month typo for 01-701-1015 (2014-07 → 2014-01)\n")
 cat("Bug 2: TRTEDT using date_imputation='first' (should be 'last')\n")
 cat("Bug 3: AGEGR1 boundary: AGE > 65 should be AGE >= 65\n")
 cat("\nAll 3 bugs identified. Fix and re-run.\n")
+```
+
+---
+
+## Debugging Techniques for the Pipeline
+
+### Technique 1: Break the Pipe
+
+**In SAS (equivalent step isolation):**
+```sas
+/* Run steps one at a time, check intermediate results */
+DATA step1;
+  SET dm(WHERE=(ACTARM NE "Screen Failure"));
+RUN;
+PROC CONTENTS DATA=step1; RUN;   /* check step1 */
+
+DATA step2;
+  SET step1;
+  /* ... date conversion ... */
+RUN;
+PROC PRINT DATA=step2(OBS=5); RUN;  /* check step2 */
+```
+
+**In R:**
+```r
+# This crashes somewhere — where?
+adsl <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  derive_vars_dt(...) %>%
+  left_join(ex_derived, by="USUBJID") %>%
+  mutate(SAFFL = if_else(dosed, "Y", "N"))
+
+# Break it:
+step1 <- dm %>% filter(ACTARM != "Screen Failure")
+step2 <- step1 %>% derive_vars_dt(...)
+step3 <- step2 %>% left_join(ex_derived, by="USUBJID")
+# Check nrow() at each step — find where rows change unexpectedly
+```
+
+### Technique 2: Mid-Pipe browser()
+
+```r
+adsl <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC) %>%
+  { browser(); . } %>%        # pause here, . is the data
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC)
+```
+
+At the `browser()` prompt: type `.` to see the data, `ls()` to list objects, `n` to step forward.
+
+### Technique 3: The Join Row Explosion
+
+You have 254 subjects. After a `left_join`, you suddenly have 800 rows. This is the #1 silent bug.
+
+**In SAS — equivalent problem:**
+```sas
+/* SAS MERGE requires sorted, unique BY variables */
+/* If dm has multiple rows per USUBJID, MERGE multiplies records */
+/* You'd see: NOTE: Multiple lengths were specified for the BY variable USUBJID */
+/* Or worse: wrong results without any note */
+
+/* Diagnose: */
+PROC FREQ DATA=ex NOPRINT;
+  TABLES USUBJID / OUT=ex_counts;
+RUN;
+PROC PRINT DATA=ex_counts(WHERE=(COUNT > 1)); RUN;
+```
+
+**In R:**
+```r
+# Danger: ex has multiple rows per subject
+adsl %>% left_join(ex, by = "USUBJID")   # 254 × avg 4 doses = ~800 rows!
+```
+
+**Diagnose:**
+```r
+ex %>% count(USUBJID) %>% filter(n > 1)
+# Shows every subject with multiple EX records
+```
+
+**Fix: always aggregate before joining**
+```r
+ex_first_dose <- ex %>%
+  mutate(EXSTDT = as.Date(substr(EXSTDTC, 1, 10))) %>%
+  group_by(USUBJID) %>%
+  summarise(EXSTDT_FIRST = min(EXSTDT, na.rm = TRUE), .groups = "drop")
+# Now ex_first_dose has one row per subject — safe to join
+
+adsl %>% left_join(ex_first_dose, by = "USUBJID")
+```
+
+**Safe join wrapper — crashes loudly if rows change:**
+
+```r
+safe_join <- function(left, right, by, type = "left") {
+  n_before <- nrow(left)
+  result <- switch(type,
+    left  = left_join(left, right, by = by),
+    inner = inner_join(left, right, by = by)
+  )
+  n_after <- nrow(result)
+  if (n_after != n_before)
+    stop(sprintf(
+      "Join on '%s' changed row count: %d → %d (+%d). Right side not unique!",
+      paste(by, collapse=", "), n_before, n_after, n_after - n_before
+    ))
+  result
+}
 ```
 
 ---

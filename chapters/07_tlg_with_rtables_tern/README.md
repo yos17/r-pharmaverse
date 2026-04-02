@@ -29,6 +29,39 @@ In SAS, you'd use `PROC REPORT` or `PROC TABULATE`. In R, the pharmaverse approa
 
 ---
 
+## The Biggest Mental Shift: PROC REPORT vs. rtables
+
+This is the conceptual leap from SAS to R for tables. Let's see both side by side.
+
+**In SAS (PROC REPORT):**
+```sas
+PROC REPORT DATA=adsl_safe NOWD;
+  COLUMN actarm, (age n mean std);
+  DEFINE actarm / ACROSS "Treatment Arm";
+  DEFINE age    / ANALYSIS;
+  DEFINE n      / "N" FORMAT=8.;
+  DEFINE mean   / "Mean" FORMAT=8.1;
+  DEFINE std    / "SD"   FORMAT=8.2;
+RUN;
+```
+
+**In R (pharmaverse — rtables/tern):**
+```r
+library(rtables)
+library(tern)
+
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%          # columns = treatment arms (like ACROSS in PROC REPORT)
+  analyze_vars("AGE", .stats = c("n", "mean_sd"))  # rows = statistics
+
+tbl <- build_table(lyt, adsl_safe)
+tbl
+```
+
+The key difference: in `rtables`, you **declare the layout** and then `build_table()` fills it with data — similar to how `PROC REPORT` separates column definitions from the rendering step.
+
+---
+
 ## Start With One Row: Age
 
 Don't build the whole table first. Build one row. Make it work. Then add rows.
@@ -70,13 +103,83 @@ tbl
 
 ---
 
+## Statistics Mapping: PROC MEANS vs. tern
+
+**In SAS (PROC MEANS):**
+```sas
+PROC MEANS DATA=adsl_safe N MEAN STD MEDIAN MIN MAX;
+  CLASS TRT01A;
+  VAR AGE;
+  OUTPUT OUT=age_stats N=n MEAN=mean STD=std MEDIAN=median MIN=min MAX=max;
+RUN;
+
+ODS RTF FILE="output/t14_1_1.rtf";
+PROC REPORT DATA=age_stats NOWD;
+  /* ... format for submission ... */
+RUN;
+ODS RTF CLOSE;
+```
+
+**In R (pharmaverse — tern):**
+```r
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  analyze_vars("AGE",
+    .stats  = c("n", "mean_sd", "median", "range"),
+    .labels = c(n="n", mean_sd="Mean (SD)", median="Median", range="Min, Max")
+  )
+```
+
+| SAS (`PROC MEANS`) | R (`tern`) |
+|---------------------|-----------|
+| `N` | `.stats = "n"` |
+| `MEAN` / `STD` | `.stats = "mean_sd"` |
+| `MEDIAN` | `.stats = "median"` |
+| `MIN` / `MAX` | `.stats = "range"` |
+| `Q1` / `Q3` | `.stats = "quantiles"` |
+
+---
+
 ## Add a Total Column
 
+**In SAS:**
+```sas
+/* In PROC REPORT: add an ALL column */
+PROC REPORT DATA=adsl_safe;
+  COLUMN actarm all age ...;
+  DEFINE all / COMPUTED "Total";
+  /* OR use PROC TABULATE with ALL option */
+RUN;
+```
+
+**In R (pharmaverse):**
 ```r
 lyt <- basic_table(show_colcounts = TRUE) %>%
   split_cols_by("TRT01A") %>%
   add_overall_col("Total") %>%
   analyze_vars("AGE", .stats = c("n", "mean_sd", "median", "range"))
+```
+
+---
+
+## Categorical Variables: PROC FREQ vs. count_occurrences
+
+**In SAS (PROC FREQ):**
+```sas
+PROC FREQ DATA=adsl_safe;
+  TABLES TRT01A * SEX / NOCUM NOPERCENT;
+  /* For denominator: DENOM= option or manual calculation */
+RUN;
+```
+
+**In R (pharmaverse — tern):**
+```r
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  count_occurrences_by_grade("SEX",
+    .labels = c(count_fraction="n (%)")
+  )
 ```
 
 ---
@@ -116,6 +219,30 @@ lyt <- basic_table(show_colcounts = TRUE) %>%
 
 demo_table <- build_table(lyt, adsl_safe)
 demo_table
+```
+
+---
+
+## Exporting Output
+
+**In SAS:**
+```sas
+ODS RTF FILE="output/t14_1_1.rtf";
+PROC REPORT DATA=... NOWD;
+  /* ... */
+RUN;
+ODS RTF CLOSE;
+```
+
+**In R (pharmaverse):**
+```r
+# Export to text (regulatory listings format)
+out_txt <- export_as_txt(demo_table, lpp = 60)
+writeLines(out_txt, "output/t14_1_1.txt")
+
+# Export to RTF (via r2rtf package)
+# library(r2rtf)
+# ... see r2rtf vignette for RTF export
 ```
 
 ---
@@ -183,6 +310,52 @@ cat("\nSaved: output/t14_1_1.txt\n")
 
 ---
 
+## Nested Rows: PROC TABULATE vs. split_rows_by
+
+**In SAS (PROC TABULATE):**
+```sas
+PROC TABULATE DATA=adae_teae;
+  CLASS TRT01A AEBODSYS AEDECOD;
+  TABLE AEBODSYS * AEDECOD,
+        TRT01A * (N PCTN<TRT01A>) / BOX="System Organ Class/Preferred Term";
+RUN;
+```
+
+**In R (pharmaverse — rtables/tern):**
+```r
+lyt_ae <- basic_table() %>%
+  split_cols_by("TRT01A") %>%
+  split_rows_by("AEBODSYS",              # rows split by SOC (like AEBODSYS row in PROC TABULATE)
+    child_labels = "visible",
+    nested       = FALSE) %>%
+  count_occurrences("AEDECOD")           # leaf rows = preferred terms
+```
+
+---
+
+## Denominator Control
+
+**In SAS:**
+```sas
+/* DENOM= option controls the denominator */
+PROC FREQ DATA=adae_teae;
+  TABLES TRT01A * AEDECOD / NOCUM;
+  WEIGHT / DENOM = adsl_safe_n;  /* % based on safety population */
+RUN;
+```
+
+**In R (pharmaverse):**
+```r
+# alt_counts_df provides denominators from full safety population
+ae_table <- build_table(
+  lyt_ae,
+  df            = adae_teae,
+  alt_counts_df = adsl_safe    # denominators from full safety population
+)
+```
+
+---
+
 ## Listings with rlistings
 
 Listings are simpler — no statistics, just formatted rows:
@@ -240,6 +413,8 @@ ggsurvfit(km_fit, linewidth = 1) +
 
 ggsave("output/f14_2_1_km_os.png", width = 10, height = 7)
 ```
+
+> **SAS equivalent for KM plots:** `PROC LIFETEST` produces the Kaplan-Meier curve. `ggsurvfit` is the R pharmaverse equivalent. Both use the same underlying Kaplan-Meier estimator — the results should be numerically identical.
 
 ---
 
