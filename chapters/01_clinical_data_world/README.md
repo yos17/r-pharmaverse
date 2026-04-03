@@ -372,3 +372,127 @@ pharm001_ch01.R    [done] — load DM, count subjects, basic demographics
 ```
 
 *Next chapter adds the first real quality check to that foundation.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Load all four domains and inspect their dimensions and subject overlap.
+
+```r
+# SAS:
+# PROC SQL; SELECT COUNT(*), COUNT(DISTINCT USUBJID) FROM ae; QUIT;
+# PROC SQL; SELECT COUNT(*) FROM ae WHERE USUBJID NOT IN (SELECT USUBJID FROM dm); QUIT;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+ae <- pharmaversesdtm::ae
+vs <- pharmaversesdtm::vs
+ex <- pharmaversesdtm::ex
+
+for (nm in c("dm","ae","vs","ex")) {
+  df <- get(nm)
+  cat(sprintf("%-5s: %4d rows, %3d USUBJIDs\n",
+              toupper(nm), nrow(df), n_distinct(df$USUBJID)))
+}
+
+# Check: are all AE subjects in DM?
+orphan_ae <- setdiff(unique(ae$USUBJID), unique(dm$USUBJID))
+cat(sprintf("\nAE subjects NOT in DM: %d\n", length(orphan_ae)))
+# Expected output:
+# DM   :  306 rows, 306 USUBJIDs
+# AE   : 1191 rows, 254 USUBJIDs
+# VS   : 3855 rows, 305 USUBJIDs
+# EX   :  590 rows, 254 USUBJIDs
+# AE subjects NOT in DM: 0
+```
+
+### Exercise 2
+
+Translate the SAS `DATA` step filter to `dplyr`.
+
+```r
+# SAS equivalent:
+# DATA want;
+#   SET dm;
+#   WHERE SEX = "F" AND AGE >= 50;
+#   KEEP USUBJID AGE RACE ACTARM;
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+
+want <- dm %>%
+  filter(SEX == "F", AGE >= 50) %>%     # R is case-sensitive: "F" not "f"
+  select(USUBJID, AGE, RACE, ACTARM)
+
+cat(sprintf("Females aged 50+: %d\n", nrow(want)))
+print(head(want, 5))
+```
+
+### Exercise 3
+
+Find the subject with the most AEs and their treatment arm.
+
+```r
+# SAS:
+# PROC FREQ DATA=ae;
+#   TABLES USUBJID / ORDER=FREQ;
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+ae   <- pharmaversesdtm::ae
+dm   <- pharmaversesdtm::dm
+
+top_ae_subject <- ae %>%
+  count(USUBJID, sort = TRUE) %>%
+  slice_head(n = 1) %>%
+  left_join(dm %>% select(USUBJID, ACTARM), by = "USUBJID")
+
+cat(sprintf("Subject with most AEs: %s\n", top_ae_subject$USUBJID))
+cat(sprintf("Number of AEs: %d\n", top_ae_subject$n))
+cat(sprintf("Treatment arm: %s\n", top_ae_subject$ACTARM))
+```
+
+### Exercise 4
+
+Convert `RFSTDTC` to R `Date`, handling `NA` values gracefully.
+
+```r
+# SAS:
+# DATA dm2;
+#   SET dm;
+#   RFSTDT = INPUT(RFSTDTC, YYMMDD10.);   /* NA → missing . */
+#   FORMAT RFSTDT DATE9.;
+# RUN;
+# PROC MEANS DATA=dm2 N NMISS; VAR RFSTDT; RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+
+# Function: converts ISO8601 character to Date, counting valids
+convert_rfstdtc <- function(dtc_vec) {
+  result <- as.Date(dtc_vec)       # NA-safe: as.Date(NA) = NA
+  n_valid   <- sum(!is.na(result))
+  n_missing <- sum(is.na(result))
+  cat(sprintf("Valid dates:   %d\n", n_valid))
+  cat(sprintf("Missing/NA:    %d\n", n_missing))
+  invisible(result)
+}
+
+dm$RFSTDT <- convert_rfstdtc(dm$RFSTDTC)
+
+# Subjects with valid reference start date
+dm_with_start <- dm %>% filter(!is.na(RFSTDT))
+cat(sprintf("Subjects with valid RFSTDT: %d / %d\n", nrow(dm_with_start), nrow(dm)))
+```

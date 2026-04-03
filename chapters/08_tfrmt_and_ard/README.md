@@ -358,3 +358,214 @@ output/
 ---
 
 *Next: Chapter 9 — we export ADSL (and all ADaM) to XPT with full metadata. We'll fix every problem from the exercise above.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add a filter for `AESEV == "SEVERE"` and produce a separate severe TEAE table.
+
+```r
+# SAS:
+# DATA adae_severe;
+#   SET adae_teae;
+#   WHERE AESEV = "SEVERE";
+# RUN;
+# /* The PROC REPORT layout is identical — just a different input dataset */
+# PROC REPORT DATA=adae_severe NOWD;
+#   COLUMN TRT01A, (n pct) AEBODSYS AEDECOD;
+#   /* ... same column/row definitions ... */
+# RUN;
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae  <- pharmaverseadam::adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
+adsl_safe  <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+# Filter to severe AEs only
+adae_severe <- adae_teae %>% filter(AESEV == "SEVERE")
+
+cat(sprintf("All TEAEs: %d events\n", nrow(adae_teae)))
+cat(sprintf("Severe TEAEs: %d events (%d subjects)\n",
+            nrow(adae_severe), n_distinct(adae_severe$USUBJID)))
+
+# The layout is IDENTICAL — only the input data changes
+lyt <- basic_table(
+  title     = "Table: Severe Treatment-Emergent Adverse Events by SOC/PT",
+  subtitles = "Safety Population",
+  show_colcounts = TRUE
+) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  split_rows_by("AEBODSYS", child_labels = "visible", nested = FALSE, label_pos = "topleft") %>%
+  count_occurrences("AEDECOD", .indent_mods = c(count_fraction = 1L))
+
+severe_tbl <- build_table(lyt, adae_severe, alt_counts_df = adsl_safe) %>%
+  sort_at_path(path = c("AEBODSYS"), scorefun = cont_n_allcols, decreasing = TRUE)
+
+print(severe_tbl)
+
+cat("\nNote: the column layout is identical — only the input df changed.\n")
+cat("This is the power of separating layout from data in rtables.\n")
+```
+
+### Exercise 2
+
+Build an ARD for AE incidence by `AEDECOD` and `TRT01A`, export as CSV.
+
+```r
+# SAS:
+# ODS OUTPUT CrossTabFreqs = ard_ae;
+# PROC FREQ DATA=adae_teae;
+#   TABLES TRT01A * AEDECOD / NOCUM;
+# RUN;
+# /* This is an "ARD-like" dataset but not in the standard tidy format */
+# PROC EXPORT DATA=ard_ae OUTFILE="output/ard_ae.csv" DBMS=CSV REPLACE; RUN;
+
+library(cards)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae <- pharmaverseadam::adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+# Build ARD for AE incidence
+# Note: cards uses subject-level, not event-level, for incidence
+adae_unique_subj_pt <- adae_teae %>%
+  distinct(USUBJID, TRT01A, AEDECOD)
+
+ard_ae <- ard_categorical(
+  data      = adae_unique_subj_pt,
+  variables = AEDECOD,
+  by        = TRT01A,
+  statistic = ~ categorical_summary_fns(c("n", "p"))
+)
+
+cat(sprintf("ARD rows: %d\n", nrow(ard_ae)))
+cat("First 10 rows:\n")
+ard_ae %>%
+  filter(stat_name %in% c("n", "p")) %>%
+  head(10) %>%
+  select(group1_level, variable_level, stat_name, stat) %>%
+  print()
+
+# Export to CSV
+dir.create("output", showWarnings = FALSE)
+ard_export <- ard_ae %>%
+  select(group1, group1_level, variable, variable_level, stat_name, stat) %>%
+  filter(stat_name %in% c("n", "p")) %>%
+  tidyr::pivot_wider(names_from = stat_name, values_from = stat)
+
+write.csv(ard_export, "output/ard_ae_incidence.csv", row.names = FALSE)
+cat("Saved: output/ard_ae_incidence.csv\n")
+```
+
+### Exercise 3
+
+Demonstrate the effect of omitting `alt_counts_df` on AE table percentages.
+
+```r
+# SAS:
+# /* The denominator must be explicitly controlled */
+# /* PROC FREQ DENOM= option or manual computation */
+# /* Without explicit denominator, % is of AE records (wrong!) */
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae <- pharmaverseadam::adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  count_occurrences("AEDECOD", .indent_mods = c(count_fraction = 1L))
+
+# Build WITH correct denominator (safety population)
+tbl_correct <- build_table(lyt, adae_teae, alt_counts_df = adsl_safe)
+
+# Build WITHOUT alt_counts_df (denominator = AE records — WRONG!)
+tbl_wrong   <- build_table(lyt, adae_teae)
+
+cat("Column counts WITH alt_counts_df (correct — safety population per arm):\n")
+cat(export_as_txt(tbl_correct)[1:5], sep="\n")
+
+cat("\nColumn counts WITHOUT alt_counts_df (wrong — AE count per arm):\n")
+cat(export_as_txt(tbl_wrong)[1:5], sep="\n")
+
+cat("\nExplanation:\n")
+cat("  WITH alt_counts_df:    denominator = N subjects in safety pop (e.g., 134 per arm)\n")
+cat("  WITHOUT alt_counts_df: denominator = N AE records (e.g., 400 per arm)\n")
+cat("  Percentages without alt_counts_df are MEANINGLESS for clinical interpretation.\n")
+cat("  Always use alt_counts_df for incidence tables.\n")
+```
+
+### Exercise 4
+
+XPT round-trip test for ADSL: check label survival, date formats, variable order.
+
+```r
+# SAS:
+# LIBNAME out XPORT 'output/adam/adsl_naive.xpt';
+# DATA out.adsl; SET adsl; RUN;
+# LIBNAME check XPORT 'output/adam/adsl_naive.xpt';
+# PROC CONTENTS DATA=check.adsl; RUN;   /* check labels, formats, lengths */
+
+library(haven)
+library(pharmaverseadam)
+library(dplyr)
+
+adsl <- pharmaverseadam::adsl
+
+dir.create("output/adam", recursive = TRUE, showWarnings = FALSE)
+
+# Naive write
+haven::write_xpt(adsl, "output/adam/adsl_naive.xpt",
+                 version = 5, name = "ADSL")
+
+# Read back
+adsl_back <- haven::read_xpt("output/adam/adsl_naive.xpt")
+
+cat("=== XPT Round-Trip Check ===\n\n")
+
+# Row/col count
+cat(sprintf("Original rows: %d  cols: %d\n", nrow(adsl), ncol(adsl)))
+cat(sprintf("Read-back rows: %d  cols: %d\n", nrow(adsl_back), ncol(adsl_back)))
+
+# 1. Labels
+cat("\n1. Variable labels:\n")
+for (v in c("USUBJID", "AGE", "TRTSDT", "TRT01P", "SAFFL")) {
+  if (v %in% names(adsl_back)) {
+    lbl <- attr(adsl_back[[v]], "label")
+    cat(sprintf("  %-12s: %s\n", v, if (!is.null(lbl)) lbl else "(no label — LOST)"))
+  }
+}
+
+# 2. Date format
+cat("\n2. Date SAS format:\n")
+for (v in c("TRTSDT", "TRTEDT")) {
+  if (v %in% names(adsl_back)) {
+    fmt <- attr(adsl_back[[v]], "format.sas")
+    cat(sprintf("  %-12s: %s\n", v, if (!is.null(fmt)) fmt else "(no format — check)"))
+  }
+}
+
+# 3. Column class
+cat("\n3. Column classes (first 5):\n")
+for (v in names(adsl_back)[1:5]) {
+  cat(sprintf("  %-12s: %s\n", v, class(adsl_back[[v]])[1]))
+}
+
+cat("\nProblems found (fix with xportr in Chapter 9):\n")
+cat("  - Labels may survive if set as attributes\n")
+cat("  - Date SAS format (DATE9.) may not be applied without xportr_format()\n")
+cat("  - Variable order may differ from spec\n")
+cat("  - Integer vs. double types may mismatch\n")
+```

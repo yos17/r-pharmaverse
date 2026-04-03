@@ -561,3 +561,221 @@ pharm001_ch05_adsl.R     — complete ADSL (all variables for Table 14.1.1)
 ---
 
 *Next: Chapter 6 — ADAE. The SAP requires a TEAE table. We build it.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add `RANDFL` (randomized flag) and `ENRLFL` (enrolled flag, including screen failures), and explain the difference.
+
+```r
+# SAS:
+# /* ENRLFL: everyone who signed ICF — in DM regardless of arm */
+# /* RANDFL: everyone who was randomized — has an ACTARMCD other than screen failure */
+# DATA adsl_all;
+#   SET dm;  /* DO NOT filter screen failures for ENRLFL */
+#   ENRLFL = "Y";
+#   IF ACTARM NE "Screen Failure" THEN RANDFL = "Y";
+#   ELSE RANDFL = "N";
+# RUN;
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+dm <- pharmaversesdtm::dm
+
+# ENRLFL applies to ALL subjects (including screen failures)
+# RANDFL applies only to those who made it past screening
+adsl_with_flags <- dm %>%
+  mutate(
+    ENRLFL = "Y",    # everyone in DM signed ICF → enrolled
+    RANDFL = if_else(ACTARM != "Screen Failure", "Y", "N")
+  )
+
+cat("Enrollment flags:\n")
+cat(sprintf("  ENRLFL = Y: %d (all DM subjects)\n",
+            sum(adsl_with_flags$ENRLFL == "Y")))
+cat(sprintf("  RANDFL = Y: %d (non-screen-failure)\n",
+            sum(adsl_with_flags$RANDFL == "Y")))
+cat(sprintf("  Screen failures: %d\n",
+            sum(adsl_with_flags$RANDFL == "N")))
+
+cat("\nDifference between enrolled and ITT:\n")
+cat("  ENRLFL = Y: All subjects who signed ICF (including screen failures)\n")
+cat("  ITTFL  = Y: All randomized subjects regardless of treatment received\n")
+cat("  RANDFL = Y: In this study, identical to ITTFL (all randomized = all ITT)\n")
+```
+
+### Exercise 2
+
+Derive `DCSREAS` (discontinuation reason) from DS using the five required categories.
+
+```r
+# SAS:
+# DATA adsl;
+#   SET adsl;
+#   IF      DSDECOD = "COMPLETED"                         THEN DCSREAS = "COMPLETED";
+#   ELSE IF DSDECOD = "ADVERSE EVENT"                     THEN DCSREAS = "ADVERSE EVENT";
+#   ELSE IF DSDECOD = "LACK OF EFFICACY"                  THEN DCSREAS = "LACK OF EFFICACY";
+#   ELSE IF INDEX(DSDECOD, "WITHDRAWAL") > 0 OR
+#           DSDECOD = "WITHDRAWAL BY SUBJECT"              THEN DCSREAS = "WITHDRAWAL BY SUBJECT";
+#   ELSE IF NOT MISSING(DSDECOD)                          THEN DCSREAS = "OTHER";
+#   ELSE                                                       DCSREAS = "";
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+library(stringr)
+
+ds   <- pharmaversesdtm::ds
+adsl <- pharmaverseadam::adsl
+
+# Get last disposition record per subject
+ds_last <- ds %>%
+  arrange(USUBJID, DSSTDTC) %>%
+  group_by(USUBJID) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  select(USUBJID, DSDECOD)
+
+adsl_dc <- adsl %>%
+  left_join(ds_last, by = "USUBJID") %>%
+  mutate(
+    DCSREAS = case_when(
+      DSDECOD == "COMPLETED"                              ~ "COMPLETED",
+      DSDECOD == "ADVERSE EVENT"                         ~ "ADVERSE EVENT",
+      DSDECOD == "LACK OF EFFICACY"                      ~ "LACK OF EFFICACY",
+      str_detect(DSDECOD, "WITHDRAWAL") |
+        DSDECOD == "WITHDRAWAL BY SUBJECT"               ~ "WITHDRAWAL BY SUBJECT",
+      !is.na(DSDECOD)                                    ~ "OTHER",
+      TRUE                                               ~ NA_character_
+    )
+  )
+
+cat("Discontinuation reasons:\n")
+print(count(adsl_dc, DCSREAS, sort = TRUE))
+```
+
+### Exercise 3
+
+Run `diffdf()` on your ADSL vs. the reference and identify matching vs. differing variables.
+
+```r
+# SAS: PROC COMPARE DATA=adsl_mine COMPARE=adsl_ref LISTALL LISTVAR; ID USUBJID; RUN;
+
+library(dplyr)
+library(admiral)
+library(diffdf)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+library(labelled)
+library(stringr)
+
+# Build ADSL (abbreviated — use pharm001_ch05_adsl.R for full derivation)
+dm <- pharmaversesdtm::dm
+ds <- pharmaversesdtm::ds
+ex <- pharmaversesdtm::ex
+
+ds_last <- ds %>%
+  arrange(USUBJID, DSSTDTC) %>%
+  group_by(USUBJID) %>% slice_tail(n=1) %>% ungroup() %>%
+  select(USUBJID, DSDECOD)
+
+ex_dosed <- ex %>%
+  group_by(USUBJID) %>%
+  summarise(DOSED = any(!is.na(EXSTDTC)), .groups = "drop")
+
+adsl_mine <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  mutate(TRT01P = ACTARM, TRT01A = ACTARM) %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first") %>%
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC,  date_imputation = "last") %>%
+  mutate(TRTDURD = as.integer(TRTEDT - TRTSDT + 1),
+         AGEGR1  = case_when(AGE < 40 ~ "<40", AGE >= 40 & AGE < 65 ~ "40-64",
+                             AGE >= 65 ~ ">=65", TRUE ~ NA_character_)) %>%
+  left_join(ds_last, by = "USUBJID") %>%
+  mutate(COMPLFL = if_else(DSDECOD == "COMPLETED", "Y", "N"),
+         EOSSTT  = case_when(DSDECOD == "COMPLETED" ~ "COMPLETED",
+                             is.na(DSDECOD) ~ "ONGOING", TRUE ~ "DISCONTINUED")) %>%
+  left_join(ex_dosed, by = "USUBJID") %>%
+  mutate(ITTFL = "Y", SAFFL = if_else(DOSED == TRUE, "Y", "N"),
+         PPROTFL = if_else(SAFFL == "Y" & COMPLFL == "Y", "Y", "N")) %>%
+  select(-DOSED, -DSDECOD)
+
+adsl_ref <- pharmaverseadam::adsl
+
+# Variables in common
+common_vars <- intersect(names(adsl_mine), names(adsl_ref))
+cat(sprintf("Variables in my ADSL:   %d\n", ncol(adsl_mine)))
+cat(sprintf("Variables in reference: %d\n", ncol(adsl_ref)))
+cat(sprintf("Variables in common:    %d\n", length(common_vars)))
+
+# Run comparison on common variables only
+diff_result <- diffdf(
+  base    = adsl_mine  %>% select(all_of(c("USUBJID", intersect(common_vars, names(adsl_mine))))),
+  compare = adsl_ref   %>% select(all_of(c("USUBJID", intersect(common_vars, names(adsl_ref))))),
+  keys    = "USUBJID"
+)
+
+if (diffdf_issame(diff_result)) {
+  cat("All common variables match exactly!\n")
+} else {
+  cat("Differences found:\n")
+  print(diff_result)
+}
+```
+
+### Exercise 4
+
+Flag treatment-emergent AEs (start on or after `TRTSDT`) and count TEAEs and subjects.
+
+```r
+# SAS:
+# DATA adae_flag;
+#   MERGE ae(IN=inAE) adsl(KEEP=USUBJID TRTSDT IN=inADSL);
+#   BY USUBJID;
+#   IF inAE;
+#   ASTDT = INPUT(AESTDTC, YYMMDD10.);
+#   FORMAT ASTDT DATE9.;
+#   IF NOT MISSING(ASTDT) AND NOT MISSING(TRTSDT) AND
+#      ASTDT >= TRTSDT THEN TRTEMFL = "Y";
+# RUN;
+# PROC SQL;
+#   SELECT COUNT(*) AS N_TEAE, COUNT(DISTINCT USUBJID) AS N_SUBJ
+#   FROM adae_flag WHERE TRTEMFL = "Y";
+# QUIT;
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+ae   <- pharmaversesdtm::ae
+adsl <- pharmaverseadam::adsl
+
+# Flag TEAEs
+adae_flag <- ae %>%
+  left_join(adsl %>% select(USUBJID, TRTSDT, SAFFL), by = "USUBJID") %>%
+  mutate(
+    ASTDT   = as.Date(substr(AESTDTC, 1, 10)),
+    TRTEMFL = case_when(
+      !is.na(ASTDT) & !is.na(TRTSDT) & ASTDT >= TRTSDT ~ "Y",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(SAFFL == "Y")   # safety population only
+
+n_safety  <- adsl %>% filter(SAFFL == "Y") %>% nrow()
+n_teae    <- sum(adae_flag$TRTEMFL == "Y", na.rm = TRUE)
+n_subjects <- adae_flag %>% filter(TRTEMFL == "Y") %>% distinct(USUBJID) %>% nrow()
+
+cat(sprintf("Safety population: %d\n", n_safety))
+cat(sprintf("TEAEs (events):    %d\n", n_teae))
+cat(sprintf("Subjects w/ TEAE:  %d (%.1f%%)\n",
+            n_subjects, 100 * n_subjects / n_safety))
+```

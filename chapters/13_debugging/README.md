@@ -570,3 +570,279 @@ renv.lock                — locked package versions
 ---
 
 *The pharmaverse doesn't change the debugging tools. It just gives you better things to debug.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Implement `safe_join()` and apply it to every join in `pharm001_ch11_adsl.R`.
+
+```r
+# SAS: /* MERGE with NODUPKEY in a preceding PROC SORT catches the symptom, not the cause */
+# PROC SORT DATA=ex NODUPKEY OUT=ex_unique; BY USUBJID; RUN;
+# DATA adsl; MERGE adsl(IN=a) ex_unique(IN=b); BY USUBJID; IF a; RUN;
+# /* SAS silently multiplies rows without NODUPKEY — no error, wrong results */
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+# Safe join: crashes loudly if right side is not unique on the by-key
+safe_join <- function(left, right, by, type = "left") {
+  n_before <- nrow(left)
+
+  result <- switch(type,
+    left  = left_join(left, right, by = by),
+    inner = inner_join(left, right, by = by),
+    right = right_join(left, right, by = by),
+    stop("type must be one of: left, inner, right")
+  )
+
+  n_after <- nrow(result)
+  if (n_after != n_before) {
+    stop(sprintf(
+      "safe_join: '%s' join on [%s] changed row count %d → %d (+%d rows). ",
+      type,
+      paste(by, collapse=", "),
+      n_before, n_after, n_after - n_before
+    ),
+    "Right-side dataset is not unique on the join key. ",
+    "Pre-aggregate with group_by() + summarise() before joining."
+    )
+  }
+  result
+}
+
+# Apply safe_join throughout the ADSL pipeline
+dm <- pharmaversesdtm::dm
+ds <- pharmaversesdtm::ds
+ex <- pharmaversesdtm::ex
+
+# Disposition: last record per subject (safe — one row per subject after slice_tail)
+ds_last <- ds %>%
+  arrange(USUBJID, DSSTDTC) %>%
+  group_by(USUBJID) %>% slice_tail(n=1) %>% ungroup() %>%
+  select(USUBJID, DSDECOD)
+
+# EX: aggregate to one row per subject before joining
+ex_dosed <- ex %>%
+  group_by(USUBJID) %>%
+  summarise(DOSED = any(!is.na(EXSTDTC)), .groups = "drop")
+
+adsl <- dm %>%
+  filter(ACTARM != "Screen Failure") %>%
+  mutate(TRT01P = ACTARM, TRT01A = ACTARM) %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first") %>%
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC,  date_imputation = "last")
+
+# Use safe_join for each merge step
+adsl <- safe_join(adsl, ds_last, by = "USUBJID")   # should be fine (1 row per subject)
+adsl <- safe_join(adsl, ex_dosed, by = "USUBJID")  # should be fine (already aggregated)
+
+cat(sprintf("ADSL rows after safe joins: %d\n", nrow(adsl)))
+cat("No safe_join errors = all right-side datasets were unique. ✓\n\n")
+
+# Now test that safe_join DOES fire on an unsafe join
+cat("Testing safe_join fires on multi-row right side:\n")
+tryCatch({
+  safe_join(adsl %>% head(5), ex, by = "USUBJID")  # ex has multiple rows per subject → BOOM
+  cat("Should not reach here!\n")
+}, error = function(e) {
+  cat(sprintf("[EXPECTED ERROR] %s\n", conditionMessage(e)))
+})
+```
+
+### Exercise 2
+
+Introduce 3 bugs in ADAE and catch all three with `diffdf()`.
+
+```r
+# SAS: PROC COMPARE DATA=adae_buggy COMPARE=adae_ref LISTALL; ID USUBJID AESEQ; RUN;
+
+library(dplyr)
+library(admiral)
+library(diffdf)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+ae   <- pharmaversesdtm::ae
+adsl <- pharmaverseadam::adsl
+
+# --- Build reference ADAE ---
+adae_ref <- pharmaverseadam::adae
+
+# --- Build buggy ADAE ---
+# Bug 1: swap TRTEMFL for two specific subjects (set non-TEAEs to Y and vice versa)
+# Bug 2: wrong ASTDY for one subject (off by 1)
+# Bug 3: wrong ASEVN for all MODERATE events (use 1 instead of 2)
+
+adae_buggy <- ae %>%
+  left_join(adsl %>% select(USUBJID, TRTSDT, TRTEDT, SAFFL, TRT01A), by = "USUBJID") %>%
+  filter(SAFFL == "Y") %>%
+  derive_vars_dt(new_vars_prefix = "AST", dtc = AESTDTC, date_imputation = "first") %>%
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ASTDT)) %>%
+  derive_var_trtemfl(new_var = TRTEMFL, trt_start_date = TRTSDT,
+                     trt_end_date = TRTEDT, end_window = 30) %>%
+  mutate(
+    ASEVN = case_when(
+      AESEV == "MILD"     ~ 1L,
+      AESEV == "MODERATE" ~ 1L,    # BUG 3: should be 2L
+      AESEV == "SEVERE"   ~ 3L,
+      TRUE                ~ NA_integer_
+    )
+  )
+
+# Bug 1: flip TRTEMFL for first two subjects
+bad_ids <- head(unique(adae_buggy$USUBJID), 2)
+adae_buggy <- adae_buggy %>%
+  mutate(TRTEMFL = if_else(USUBJID %in% bad_ids,
+                           if_else(TRTEMFL == "Y", NA_character_, "Y"),
+                           TRTEMFL))
+
+# Bug 2: ASTDY off by 1 for one AE record
+adae_buggy <- adae_buggy %>%
+  mutate(ASTDY = if_else(row_number() == 10L, ASTDY + 1L, ASTDY))
+
+cat("=== Buggy ADAE Bug Hunt ===\n\n")
+
+# Find common keys for comparison
+common_keys <- c("USUBJID", "AESEQ")
+common_vars <- intersect(names(adae_buggy), names(adae_ref))
+
+diff_result <- diffdf(
+  base    = adae_buggy %>% select(all_of(c(common_keys, setdiff(common_vars, common_keys)))),
+  compare = adae_ref   %>% select(all_of(c(common_keys, setdiff(common_vars, names(adae_ref))))),
+  keys    = common_keys
+)
+
+if (diffdf_issame(diff_result)) {
+  cat("No differences — bugs not detected (check variable names match)\n")
+} else {
+  cat("Differences found:\n")
+  print(diff_result)
+
+  cat("\nBug summary:\n")
+  cat("  Bug 1: TRTEMFL swapped for 2 subjects\n")
+  cat("  Bug 2: ASTDY off by 1 for row 10\n")
+  cat("  Bug 3: ASEVN = 1 for MODERATE (should be 2) — affects all MODERATE events\n")
+}
+```
+
+### Exercise 3
+
+Use `debugonce()` to step through `derive_vars_dt()` for a subject with a partial date.
+
+```r
+# SAS: No equivalent interactive debugger. SAS debugging is limited to
+# MPRINT/MLOGIC for macros, or PROC PRINT at each step.
+# R's debugonce() pauses at function entry for a single call — very powerful.
+
+library(admiral)
+library(pharmaversesdtm)
+library(dplyr)
+
+dm <- pharmaversesdtm::dm
+
+# Find a subject with a partial RFXENDTC (if any)
+partial <- dm %>%
+  filter(!is.na(RFXENDTC), grepl("^\\d{4}-\\d{2}$", RFXENDTC)) %>%
+  select(USUBJID, RFXENDTC)
+
+cat("Subjects with partial RFXENDTC (YYYY-MM):\n")
+print(partial)
+
+# If partial dates exist, debug the imputation:
+cat("\nTo step through date imputation interactively:\n")
+cat("1. Run: debugonce(admiral::derive_vars_dt)\n")
+cat("2. Then run the derive_vars_dt() call below\n")
+cat("3. At the browser prompt: use 'n' to step, 'ls()' to list objects,\n")
+cat("   '.data' or equivalent to see the data, 'Q' to quit\n\n")
+
+# The call to debug (run interactively):
+cat("Code to debug:\n")
+cat("debugonce(admiral::derive_vars_dt)\n")
+cat("dm %>%\n")
+cat("  head(5) %>%\n")
+cat("  derive_vars_dt(\n")
+cat("    new_vars_prefix = 'TRTE',\n")
+cat("    dtc             = RFXENDTC,\n")
+cat("    date_imputation = 'last'\n")
+cat("  )\n\n")
+
+cat("What to observe inside the function:\n")
+cat("  - How dtc (RFXENDTC) is parsed\n")
+cat("  - When 'last' imputation fires (for YYYY-MM strings)\n")
+cat("  - The imputation flag (TRTEDTF) being set to 'D'\n")
+cat("  - Difference between 'first' (→ day 01) and 'last' (→ last day of month)\n\n")
+
+cat("Without debugonce(), you can inspect post-hoc:\n")
+result <- dm %>%
+  filter(!is.na(RFXENDTC)) %>%
+  head(10) %>%
+  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC, date_imputation = "last")
+
+# TRTEDTF = "D" means day was imputed
+if ("TRTEDT" %in% names(result) && "TRTED" %in% names(result)) {
+  result %>%
+    select(USUBJID, RFXENDTC, TRTEDT, TRTED) %>%
+    filter(!is.na(TRTED)) %>%
+    print()
+} else {
+  result %>% select(USUBJID, RFXENDTC, TRTEDT) %>% print()
+}
+```
+
+### Exercise 4
+
+Run `run_all.R` from a clean session using only `renv.lock` packages.
+
+```r
+# This simulates the submission QA process: reproduce results from a clean environment.
+# SAS equivalent: re-running on a clean SAS session with documented version/macro catalog.
+
+cat("=== PHARM-001 Clean Session QA ===\n\n")
+cat("Steps to run run_all.R from a clean environment:\n\n")
+
+cat("1. On the QA machine (or a clean R session):\n")
+cat("   # Start fresh R session (or use Rscript from terminal)\n")
+cat("   setwd('~/Projects/r-pharmaverse')\n")
+cat("   renv::restore()   # install exactly the locked versions\n\n")
+
+cat("2. Run the full pipeline:\n")
+cat("   source('run_all.R')\n\n")
+
+cat("3. Compare outputs:\n")
+cat("   # Compare XPT files\n")
+cat("   library(haven)\n")
+cat("   library(diffdf)\n")
+cat("   adsl_prod <- haven::read_xpt('output/adam/adsl.xpt')\n")
+cat("   adsl_qa   <- haven::read_xpt('qa_output/adam/adsl.xpt')\n")
+cat("   diffdf(adsl_prod, adsl_qa, keys = 'USUBJID')\n\n")
+
+cat("4. Expected: diffdf_issame() = TRUE for all datasets.\n\n")
+
+# Demonstrate the clean-session check programmatically:
+# Verify all required packages are available
+required_pkgs <- c(
+  "admiral","pharmaversesdtm","pharmaverseadam",
+  "rtables","tern","xportr","logrx","diffdf",
+  "cards","haven","dplyr","tidyr","lubridate"
+)
+
+cat("Package availability check:\n")
+all_ok <- TRUE
+for (pkg in required_pkgs) {
+  available <- requireNamespace(pkg, quietly = TRUE)
+  ver       <- if (available) as.character(packageVersion(pkg)) else "NOT INSTALLED"
+  status    <- if (available) "OK" else "MISSING"
+  if (!available) all_ok <- FALSE
+  cat(sprintf("  %-25s: %-10s  %s\n", pkg, ver, status))
+}
+
+cat(sprintf("\nAll packages available: %s\n", if (all_ok) "YES ✓" else "NO — install missing packages"))
+cat("\nWith renv::restore(), everyone gets identical versions → reproducible results.\n")
+cat("SAS equivalent: documenting SAS version in every program header comment.\n")
+```

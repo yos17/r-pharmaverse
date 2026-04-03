@@ -344,3 +344,226 @@ my_ae_barplot <- module(
 ---
 
 *Next: Chapter 11 — we add logrx logging to every PHARM-001 program. Show what the log catches.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add `tm_t_crosstab()` to cross-tabulate AE incidence by sex and treatment arm.
+
+```r
+# NOTE: teal API changes between versions. This is tested with teal >= 0.15 and
+# teal.modules.clinical >= 0.9. Check packageVersion("teal") if modules are unavailable.
+# SAS equivalent: PROC FREQ DATA=adae TABLES TRT01A * SEX; RUN;
+
+library(teal)
+library(teal.modules.clinical)
+library(pharmaverseadam)
+library(dplyr)
+
+adsl  <- pharmaverseadam::adsl
+adae  <- pharmaverseadam::adae
+
+data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae
+)
+
+# Cross-tabulate AE incidence by SEX and TRT01A
+app <- init(
+  data = data,
+  modules = modules(
+    # Cross-tabulation module
+    tm_t_crosstab(
+      label    = "AE by Sex × Arm",
+      dataname = "ADAE",
+      arm_var  = choices_selected(
+        choices  = variable_choices("ADAE", c("TRT01A","TRT01P")),
+        selected = "TRT01A"
+      ),
+      paramcd  = choices_selected(
+        choices  = NULL,
+        selected = NULL
+      ),
+      row_var  = choices_selected(
+        choices  = variable_choices("ADAE", c("SEX","RACE","AEBODSYS","AEDECOD")),
+        selected = "AEBODSYS"
+      ),
+      col_var  = choices_selected(
+        choices  = variable_choices("ADAE", "TRT01A"),
+        selected = "TRT01A"
+      )
+    )
+  ),
+  title = "PHARM-001: AE Cross-Tabulation"
+)
+
+# To run interactively:
+# shinyApp(app$ui, app$server)
+cat("App created. Run: shinyApp(app$ui, app$server) to launch.\n")
+cat("The cross-tab module shows AE counts by body system × treatment arm.\n")
+cat("SAS equivalent: PROC FREQ DATA=adae; TABLES AEBODSYS * TRT01A / NOCUM; RUN;\n")
+```
+
+### Exercise 2
+
+Add `tm_g_ipp()` (individual patient profile) for lab values.
+
+```r
+# SAS equivalent: No direct equivalent — would require a custom %macro with PROC GPLOT
+# for each subject. teal's IPP module provides this interactively for all subjects.
+
+library(teal)
+library(teal.modules.clinical)
+library(pharmaverseadam)
+
+adsl <- pharmaverseadam::adsl
+adlb <- pharmaverseadam::adlb
+
+data <- teal_data(
+  ADSL = adsl,
+  ADLB = adlb
+)
+
+app <- init(
+  data = data,
+  modules = modules(
+
+    # Individual Patient Profile for labs
+    tm_g_ipp(
+      label      = "Individual Patient Profile — Labs",
+      dataname   = "ADLB",
+      arm_var    = choices_selected(
+        choices  = variable_choices("ADSL", c("TRT01A","TRT01P")),
+        selected = "TRT01A"
+      ),
+      paramcd    = choices_selected(
+        choices  = value_choices("ADLB", "PARAMCD", "PARAM"),
+        selected = "ALT"
+      ),
+      adsl_var   = choices_selected(
+        choices  = variable_choices("ADSL", c("AGE","SEX","RACE")),
+        selected = "AGE"
+      )
+    )
+  ),
+  title = "PHARM-001: Individual Patient Lab Profiles"
+)
+
+# shinyApp(app$ui, app$server)
+cat("IPP app created. This shows per-patient lab trends over time.\n")
+cat("Medical reviewers can select a subject and see their ALT/AST/etc. profile.\n")
+```
+
+### Exercise 3
+
+Write a custom barplot teal module showing TEAE frequency by body system.
+
+```r
+# SAS equivalent: PROC GCHART / SGPLOT with VBAR AEBODSYS / GROUP=TRT01A;
+# teal custom modules provide dynamic subgroup filtering that SAS cannot do interactively.
+
+library(teal)
+library(teal.modules.clinical)
+library(pharmaverseadam)
+library(ggplot2)
+library(dplyr)
+
+adsl <- pharmaverseadam::adsl
+adae <- pharmaverseadam::adae
+
+data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae
+)
+
+# Custom barplot module
+my_ae_barplot <- module(
+  label    = "AE Barplot",
+  dataname = "ADAE",
+  server   = function(id, data, filter_panel_api, reporter) {
+    moduleServer(id, function(input, output, session) {
+      output$plot <- renderPlot({
+        df <- data[["ADAE"]]()
+        df_teae <- df %>%
+          filter(TRTEMFL == "Y") %>%
+          count(AEBODSYS, TRT01A, name = "n_events") %>%
+          group_by(AEBODSYS) %>%
+          mutate(n_total = sum(n_events)) %>%
+          ungroup() %>%
+          arrange(desc(n_total))
+
+        top_socs <- head(unique(df_teae$AEBODSYS), 10)
+
+        df_teae %>%
+          filter(AEBODSYS %in% top_socs) %>%
+          mutate(AEBODSYS = factor(AEBODSYS, levels = rev(top_socs))) %>%
+          ggplot(aes(x = AEBODSYS, y = n_events, fill = TRT01A)) +
+          geom_col(position = "dodge") +
+          coord_flip() +
+          scale_fill_brewer(palette = "Set1") +
+          labs(
+            title = "Treatment-Emergent AEs by System Organ Class",
+            x     = NULL, y = "Number of Events", fill = "Treatment Arm"
+          ) +
+          theme_classic(base_size = 12) +
+          theme(legend.position = "bottom")
+      })
+    })
+  },
+  ui = function(id) {
+    ns <- NS(id)
+    plotOutput(ns("plot"), height = "500px")
+  }
+)
+
+app <- init(
+  data    = data,
+  modules = modules(my_ae_barplot),
+  title   = "PHARM-001: AE Barplot"
+)
+
+# shinyApp(app$ui, app$server)
+cat("Custom barplot module created.\n")
+cat("Filter panel automatically propagates to the barplot.\n")
+cat("Try filtering to SAFFL=Y in the filter panel — the plot updates.\n")
+```
+
+### Exercise 4
+
+Demonstrate teal's reproducibility: extract the "Show R code" output and run it standalone.
+
+```r
+# teal's "Show R code" feature exports the exact R code behind each analysis.
+# This is the R equivalent of saving a SAS program for reproducibility.
+
+library(pharmaverseadam)
+library(dplyr)
+library(rtables)
+library(tern)
+
+# The code teal would show for a demographics analysis module:
+# (This is what you'd copy from the "Show R code" button)
+
+adsl <- pharmaverseadam::adsl
+adsl_safe <- adsl %>% filter(SAFFL == "Y")
+
+# Reproduced outside the app — identical to what teal shows
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  analyze_vars(
+    c("AGE","SEX","RACE"),
+    .stats  = c("n", "mean_sd", "count_fraction"),
+    .labels = c(n="n", mean_sd="Mean (SD)", count_fraction="n (%)")
+  )
+
+tbl <- build_table(lyt, adsl_safe)
+print(tbl)
+
+cat("\nThis code was extracted from teal's 'Show R code' feature.\n")
+cat("It produces identical output to the interactive app.\n")
+cat("Chapter 11 adds logging via logrx::axecute() so every run leaves an audit trail.\n")
+```

@@ -345,3 +345,249 @@ output/adam/
 ---
 
 *Next: Chapter 10 — we build an interactive teal app for PHARM-001, starting with one module.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Apply the complete xportr pipeline to ADAE with a 10-variable spec.
+
+```r
+# SAS:
+# DATA out.adae;
+#   SET adae;
+#   ATTRIB
+#     STUDYID  LENGTH=$200 LABEL="Study Identifier"
+#     USUBJID  LENGTH=$200 LABEL="Unique Subject Identifier"
+#     TRTEMFL  LENGTH=$2   LABEL="Treatment Emergent Analysis Flag"
+#     AEDECOD  LENGTH=$200 LABEL="Dictionary-Derived Term"
+#     AEBODSYS LENGTH=$200 LABEL="Body System or Organ Class"
+#     AESEV    LENGTH=$10  LABEL="Severity/Intensity"
+#     AESER    LENGTH=$2   LABEL="Serious Event"
+#     ASTDT    LENGTH=8    LABEL="Analysis Start Date"              FORMAT=DATE9.
+#     ASTDY    LENGTH=8    LABEL="Analysis Start Relative Day"
+#     TRTSDT   LENGTH=8    LABEL="Date of First Exposure"           FORMAT=DATE9.;
+# RUN;
+
+library(xportr)
+library(pharmaverseadam)
+library(dplyr)
+library(haven)
+
+adae <- pharmaverseadam::adae
+
+# ADAE variable spec (10+ variables)
+var_spec_adae <- tibble::tribble(
+  ~dataset, ~variable,   ~label,                                          ~type,     ~length, ~format,
+  "ADAE", "STUDYID",   "Study Identifier",                              "text",    200,     NA,
+  "ADAE", "USUBJID",   "Unique Subject Identifier",                      "text",    200,     NA,
+  "ADAE", "TRT01A",    "Actual Treatment for Period 01",                 "text",    200,     NA,
+  "ADAE", "AESEQ",     "Sequence Number",                               "integer", 8,       NA,
+  "ADAE", "AETERM",    "Reported Term for the Adverse Event",           "text",    200,     NA,
+  "ADAE", "AEDECOD",   "Dictionary-Derived Term",                       "text",    200,     NA,
+  "ADAE", "AEBODSYS",  "Body System or Organ Class",                    "text",    200,     NA,
+  "ADAE", "AESEV",     "Severity/Intensity",                            "text",    10,      NA,
+  "ADAE", "AESER",     "Serious Event",                                  "text",    2,       NA,
+  "ADAE", "AESTDTC",   "Start Date/Time of Adverse Event",              "text",    20,      NA,
+  "ADAE", "TRTEMFL",   "Treatment Emergent Analysis Flag",              "text",    2,       NA,
+  "ADAE", "ASTDT",     "Analysis Start Date",                           "integer", 8,       "DATE9.",
+  "ADAE", "ASTDY",     "Analysis Start Relative Day",                   "integer", 8,       NA,
+  "ADAE", "TRTSDT",    "Date of First Exposure to Treatment",           "integer", 8,       "DATE9.",
+  "ADAE", "SAFFL",     "Safety Population Flag",                        "text",    2,       NA
+)
+
+dir.create("output/adam", recursive = TRUE, showWarnings = FALSE)
+
+# Full xportr pipeline
+adae_xpt <- adae %>%
+  xportr_type(metadata   = var_spec_adae, domain = "ADAE") %>%
+  xportr_label(metadata  = var_spec_adae, domain = "ADAE") %>%
+  xportr_length(metadata = var_spec_adae, domain = "ADAE",
+                length_source = "metadata") %>%
+  xportr_format(metadata = var_spec_adae, domain = "ADAE") %>%
+  xportr_order(metadata  = var_spec_adae, domain = "ADAE") %>%
+  xportr_write("output/adam/adae.xpt",
+               label = "Adverse Events Analysis Dataset")
+
+# Verify
+adae_back <- haven::read_xpt("output/adam/adae.xpt")
+cat(sprintf("ADAE XPT: %d rows × %d cols\n", nrow(adae_back), ncol(adae_back)))
+
+# Check a few labels
+for (v in c("USUBJID","TRTEMFL","ASTDT","AEDECOD")) {
+  if (v %in% names(adae_back)) {
+    lbl <- attr(adae_back[[v]], "label")
+    cat(sprintf("  %-12s: %s\n", v, if (!is.null(lbl)) lbl else "(missing)"))
+  }
+}
+```
+
+### Exercise 2
+
+Write `xpt_roundtrip_check(df, path)` that validates the XPT round-trip.
+
+```r
+# SAS: PROC COMPARE DATA=adsl_orig COMPARE=adsl_from_xpt; ID USUBJID; RUN;
+
+library(haven)
+library(dplyr)
+library(pharmaverseadam)
+
+xpt_roundtrip_check <- function(df, path, keys = NULL) {
+  # Write
+  haven::write_xpt(df, path, version = 5)
+  cat(sprintf("Written: %s (%.1f KB)\n", path, file.info(path)$size / 1024))
+
+  # Read back
+  df_back <- haven::read_xpt(path)
+
+  # Checks
+  checks_passed <- TRUE
+
+  # 1. Row count
+  if (nrow(df) == nrow(df_back)) {
+    cat(sprintf("[PASS] Row count: %d\n", nrow(df)))
+  } else {
+    cat(sprintf("[FAIL] Row count: original=%d, read-back=%d\n", nrow(df), nrow(df_back)))
+    checks_passed <- FALSE
+  }
+
+  # 2. Column count
+  if (ncol(df) == ncol(df_back)) {
+    cat(sprintf("[PASS] Column count: %d\n", ncol(df)))
+  } else {
+    cat(sprintf("[FAIL] Column count: original=%d, read-back=%d\n", ncol(df), ncol(df_back)))
+    checks_passed <- FALSE
+  }
+
+  # 3. Value comparison (numeric)
+  common_cols <- intersect(names(df), names(df_back))
+  num_cols    <- common_cols[sapply(df[common_cols], is.numeric)]
+  n_val_fail  <- 0
+  for (v in num_cols) {
+    orig <- df[[v]]
+    back <- df_back[[v]]
+    if (!isTRUE(all.equal(orig, back, tolerance = 1e-6))) {
+      cat(sprintf("[WARN] Numeric difference in: %s\n", v))
+      n_val_fail <- n_val_fail + 1
+    }
+  }
+  if (n_val_fail == 0) cat(sprintf("[PASS] All %d numeric columns match\n", length(num_cols)))
+
+  # 4. Known round-trip issues
+  date_cols <- common_cols[sapply(df[common_cols], inherits, what = "Date")]
+  if (length(date_cols) > 0) {
+    cat(sprintf("[INFO] Date columns: %s — check SAS format attribute\n",
+                paste(date_cols, collapse=", ")))
+  }
+
+  invisible(df_back)
+}
+
+adsl <- pharmaverseadam::adsl
+dir.create("output/adam", recursive = TRUE, showWarnings = FALSE)
+cat("=== ADSL Round-Trip Check ===\n")
+adsl_back <- xpt_roundtrip_check(adsl, "output/adam/adsl_rt.xpt")
+```
+
+### Exercise 3
+
+Validate SAS variable name conformance.
+
+```r
+# SAS:
+# /* SAS automatically enforces: <=8 chars, starts with letter, alphanumeric+underscore */
+# /* OPTIONS VALIDVARNAME=UPCASE enforces uppercase */
+# /* No equivalent function — violations are caught at compile time */
+
+library(dplyr)
+library(pharmaverseadam)
+
+check_sas_varnames <- function(df, dataset_name = "dataset") {
+  nms <- names(df)
+  issues <- list()
+
+  for (nm in nms) {
+    problems <- character(0)
+
+    if (nchar(nm) > 8)
+      problems <- c(problems, sprintf("name > 8 chars (%d)", nchar(nm)))
+
+    if (!grepl("^[A-Za-z]", nm))
+      problems <- c(problems, "does not start with a letter")
+
+    if (grepl("[^A-Za-z0-9_]", nm))
+      problems <- c(problems, "contains special characters")
+
+    if (nm != toupper(nm))
+      problems <- c(problems, "not uppercase")
+
+    if (length(problems) > 0)
+      issues[[nm]] <- problems
+  }
+
+  cat(sprintf("=== SAS Variable Name Check: %s ===\n", dataset_name))
+  cat(sprintf("Variables checked: %d\n", length(nms)))
+
+  if (length(issues) == 0) {
+    cat("All variable names are SAS-conformant.\n")
+  } else {
+    cat(sprintf("Issues found (%d variables):\n", length(issues)))
+    for (nm in names(issues)) {
+      cat(sprintf("  %-15s: %s\n", nm, paste(issues[[nm]], collapse="; ")))
+    }
+  }
+  invisible(issues)
+}
+
+# Check all ADaM datasets
+for (ds_name in c("adsl","adae","adtte","adlb")) {
+  df <- pharmaverseadam::get(ds_name)
+  cat("\n")
+  check_sas_varnames(df, ds_name)
+}
+```
+
+### Exercise 4
+
+Load ADSL from XPT and verify it works in a basic `teal_data()` call.
+
+```r
+# Note: teal requires a Shiny session to run interactively.
+# This shows the data preparation pattern.
+
+library(haven)
+library(dplyr)
+
+# Step 1: Write ADSL to XPT (using xportr in production)
+library(pharmaverseadam)
+library(xportr)
+adsl <- pharmaverseadam::adsl
+dir.create("output/adam", recursive = TRUE, showWarnings = FALSE)
+xportr_write(adsl, "output/adam/adsl.xpt", label = "Subject-Level Analysis Dataset")
+
+# Step 2: Read back
+adsl_xpt <- haven::read_xpt("output/adam/adsl.xpt")
+
+# Step 3: Verify column types for teal
+cat("=== XPT Column Type Check for teal ===\n")
+cat(sprintf("TRT01A class: %s (should be character for split_cols_by)\n",
+            class(adsl_xpt$TRT01A)[1]))
+cat(sprintf("AGE class:    %s (should be numeric for analyze_vars)\n",
+            class(adsl_xpt$AGE)[1]))
+cat(sprintf("TRTSDT class: %s\n", class(adsl_xpt$TRTSDT)[1]))
+
+# Fix factor/labelled columns if needed
+# haven::read_xpt returns labelled vectors — these work fine in teal
+# but if factors are needed, use as_factor() from haven
+
+adsl_clean <- adsl_xpt %>%
+  mutate(across(where(haven::is.labelled), as.character))
+
+cat(sprintf("\nRows: %d  Cols: %d\n", nrow(adsl_clean), ncol(adsl_clean)))
+cat("TRT01A unique values:\n")
+print(unique(adsl_clean$TRT01A))
+cat("Ready for: teal_data(ADSL = adsl_clean)\n")
+```

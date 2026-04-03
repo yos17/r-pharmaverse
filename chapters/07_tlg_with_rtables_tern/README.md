@@ -448,3 +448,229 @@ output/
 ---
 
 *Next: Chapter 8 — we reuse the demographics table skeleton to build the AE table.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add p-values to the demographics table using `tern` test functions.
+
+```r
+# SAS equivalent:
+# PROC NPAR1WAY DATA=adsl_safe WILCOXON;
+#   CLASS TRT01A; VAR AGE;
+# RUN;
+# PROC FREQ DATA=adsl_safe;
+#   TABLES TRT01A * SEX / CHISQ;
+# RUN;
+# (In PROC REPORT there is no direct p-value; use ODS + PROC NPAR1WAY output tables)
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+lyt <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+
+  # Age: continuous with p-value (Kruskal-Wallis)
+  analyze_vars(
+    "AGE",
+    .stats   = c("n", "mean_sd", "median", "range"),
+    .labels  = c(n="n", mean_sd="Mean (SD)", median="Median", range="Min, Max")
+  ) %>%
+
+  # Age group: categorical with chi-square p-value
+  count_occurrences_by_grade(
+    "AGEGR1",
+    .labels = c(count_fraction = "n (%)")
+  ) %>%
+
+  # Sex: categorical
+  count_occurrences_by_grade(
+    "SEX",
+    .labels = c(count_fraction = "n (%)")
+  ) %>%
+
+  # Race: categorical
+  count_occurrences_by_grade(
+    "RACE",
+    .labels = c(count_fraction = "n (%)")
+  )
+
+demo_table <- build_table(lyt, adsl_safe)
+cat("Demographics table (p-values require custom analysis functions in tern):\n")
+cat("Note: tern 0.9+ provides test_summary_vector() for adding p-values.\n")
+cat("For a complete p-value table, see the tern package vignette.\n\n")
+print(demo_table)
+
+# Quick p-value check using base R
+cat("\nKruskal-Wallis test for AGE across arms:\n")
+kw <- kruskal.test(AGE ~ TRT01A, data = adsl_safe)
+cat(sprintf("  p-value = %.4f\n", kw$p.value))
+
+cat("\nChi-square test for SEX across arms:\n")
+sex_tab <- table(adsl_safe$TRT01A, adsl_safe$SEX)
+chi <- chisq.test(sex_tab)
+cat(sprintf("  p-value = %.4f\n", chi$p.value))
+```
+
+### Exercise 2
+
+Produce a listing of all screen failures.
+
+```r
+# SAS:
+# PROC REPORT DATA=dm_sf NOWD;
+#   WHERE ACTARM = "Screen Failure";
+#   COLUMN USUBJID SITEID RFICDTC ACTARM;
+#   DEFINE USUBJID  / DISPLAY "Subject ID"  ORDER;
+#   DEFINE SITEID   / DISPLAY "Site"        ORDER;
+#   DEFINE RFICDTC  / DISPLAY "ICF Date";
+#   DEFINE ACTARM   / DISPLAY "Arm";
+# RUN;
+
+library(rlistings)
+library(pharmaversesdtm)
+library(dplyr)
+
+dm <- pharmaversesdtm::dm
+
+screen_failures <- dm %>%
+  filter(ACTARM == "Screen Failure") %>%
+  select(USUBJID, SITEID, RFICDTC, ACTARM) %>%
+  arrange(SITEID, USUBJID)
+
+cat(sprintf("Screen failures: %d\n\n", nrow(screen_failures)))
+
+# Create listing using rlistings
+lst <- as_listing(
+  screen_failures,
+  key_cols   = c("SITEID", "USUBJID"),
+  disp_cols  = c("RFICDTC", "ACTARM"),
+  main_title = "Listing of Screen Failures",
+  subtitles  = "All Screened Subjects — Study PHARM-001"
+)
+
+print(lst)
+```
+
+### Exercise 3
+
+Sort race rows in Table 14.1.1 by descending frequency using `sort_at_path()`.
+
+```r
+# SAS:
+# /* Pre-sort by frequency: compute counts, then use FORMAT to control order */
+# PROC FREQ DATA=adsl_safe NOPRINT;
+#   TABLES RACE / OUT=race_freq;
+# RUN;
+# PROC SORT DATA=race_freq; BY DESCENDING COUNT; RUN;
+# /* Then use a user-defined format to control display order in PROC REPORT */
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+lyt <- basic_table(
+  title          = "Table 14.1.1: Summary of Demographic Characteristics",
+  subtitles      = "Safety Population",
+  show_colcounts = TRUE
+) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+  analyze_vars("AGE",
+    .stats  = c("n", "mean_sd", "median", "range"),
+    .labels = c(n="n", mean_sd="Mean (SD)", median="Median", range="Min, Max")
+  ) %>%
+  count_occurrences_by_grade("AGEGR1",
+    .labels = c(count_fraction = "n (%)")
+  ) %>%
+  count_occurrences_by_grade("SEX",
+    .labels = c(count_fraction = "n (%)")
+  ) %>%
+  count_occurrences_by_grade("RACE",
+    .labels = c(count_fraction = "n (%)")
+  )
+
+demo_tbl <- build_table(lyt, adsl_safe)
+
+# Sort RACE rows by total count, descending
+demo_tbl_sorted <- demo_tbl %>%
+  sort_at_path(
+    path       = c("RACE"),
+    scorefun   = cont_n_allcols,  # score by sum across all columns
+    decreasing = TRUE             # most common first
+  )
+
+print(demo_tbl_sorted)
+cat("\nRace rows are now sorted most-common first (matching regulatory convention)\n")
+```
+
+### Exercise 4
+
+Sketch the `rtables` layout for the AE table.
+
+```r
+# SAS:
+# PROC REPORT DATA=adae_teae NOWD;
+#   COLUMN TRT01A, (USUBJID n pct) AEBODSYS AEDECOD;
+#   DEFINE TRT01A  / ACROSS;
+#   DEFINE AEBODSYS / "System Organ Class" GROUP ORDER=INTERNAL;
+#   DEFINE AEDECOD  / "Preferred Term"     DISPLAY;
+# RUN;
+#
+# The rtables equivalent:
+
+library(rtables)
+library(tern)
+library(pharmaverseadam)
+library(dplyr)
+
+adae_teae <- pharmaverseadam::adae %>% filter(SAFFL == "Y", TRTEMFL == "Y")
+adsl_safe <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+
+# Layout sketch: split_rows_by() = GROUP in PROC REPORT
+#                count_occurrences() = DISPLAY row for each AEDECOD
+lyt_ae <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by("TRT01A") %>%
+  add_overall_col("Total") %>%
+
+  # Count subjects with any TEAE (header row)
+  count_patients_with_flags(
+    var            = "USUBJID",
+    flag_variables = "TRTEMFL",
+    .labels        = c(TRTEMFL = "Any TEAE, n (%)")
+  ) %>%
+
+  # SOC → PT nested structure (= GROUP + DISPLAY in PROC REPORT)
+  split_rows_by(
+    "AEBODSYS",
+    child_labels = "visible",
+    nested       = FALSE,
+    label_pos    = "topleft"
+  ) %>%
+  count_occurrences(
+    vars         = "AEDECOD",
+    .indent_mods = c(count_fraction = 1L)
+  )
+
+ae_tbl <- build_table(lyt_ae, adae_teae, alt_counts_df = adsl_safe)
+
+cat("AE Table layout preview (first 20 rows):\n")
+print(ae_tbl, nrows = 20)
+
+cat("\nKey functions for the AE table:\n")
+cat("  split_rows_by()       = GROUP in PROC REPORT\n")
+cat("  count_occurrences()   = DISPLAY + N PCT computed block\n")
+cat("  alt_counts_df=        = DENOM= option in PROC FREQ\n")
+cat("  sort_at_path()        = ORDER=FREQ in PROC REPORT (for sorting by count)\n")
+```

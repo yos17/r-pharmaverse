@@ -331,3 +331,202 @@ pharm001_ch03_dm.R       — map raw DM to SDTM using sdtm.oak
 ---
 
 *Next: Chapter 4 — we use admiral to derive TRTSDT and TRTEDT from the SDTM we now understand.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Map `AETERM`, `AESER` (CT C66742), and `AESTDTC` from raw AE data; calculate the percentage of `AESER` CT failures.
+
+```r
+# SAS:
+# DATA ae;
+#   SET raw_ae;
+#   DOMAIN = "AE";
+#   AETERM = AETERM_RAW;    /* direct copy */
+#   IF      UPCASE(AESER) = "YES" THEN AESER = "Y";
+#   ELSE IF UPCASE(AESER) = "NO"  THEN AESER = "N";
+#   ELSE                               AESER = "";   /* unmapped */
+#   AESTDTC = PUT(INPUT(AESTDTC_RAW, DATE9.), YYMMDD10.);
+# RUN;
+
+library(dplyr)
+library(pharmaverseraw)
+
+# pharmaverseraw::ae_raw contains the raw AE data
+ae_raw <- pharmaverseraw::ae_raw
+
+cat(sprintf("Raw AE rows: %d\n", nrow(ae_raw)))
+cat("Raw AESER values:\n")
+print(table(ae_raw$AESER, useNA = "always"))
+
+# Note: sdtm.oak API may change — this pattern uses dplyr as fallback
+# For sdtm.oak, use: assign_ct(raw_dat=ae_raw, raw_var="AESER", ct_clst="C66742")
+# Here we show the dplyr approach as a safe alternative
+ae_mapped <- ae_raw %>%
+  mutate(
+    DOMAIN  = "AE",
+    AETERM  = AETERM,          # direct copy (no CT)
+    AESER   = case_when(
+      toupper(AESER) %in% c("YES","Y") ~ "Y",
+      toupper(AESER) %in% c("NO", "N") ~ "N",
+      TRUE                              ~ NA_character_   # unmapped
+    ),
+    AESTDTC = AESTDTC          # keep ISO8601 as-is if already formatted
+  )
+
+# Percentage that failed CT mapping
+n_total   <- nrow(ae_mapped)
+n_fail    <- sum(is.na(ae_mapped$AESER))
+cat(sprintf("\nAESER CT failures: %d / %d (%.1f%%)\n",
+            n_fail, n_total, 100 * n_fail / n_total))
+```
+
+### Exercise 2
+
+Add `AESEQ` as a sequence number within each `USUBJID`, ordered by `AESTDTC`.
+
+```r
+# SAS:
+# /* PROC SORT + RETAIN pattern */
+# PROC SORT DATA=ae OUT=ae_sorted; BY USUBJID AESTDTC; RUN;
+# DATA ae;
+#   SET ae_sorted;
+#   BY USUBJID;
+#   RETAIN AESEQ 0;
+#   IF FIRST.USUBJID THEN AESEQ = 0;
+#   AESEQ + 1;
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+ae <- pharmaversesdtm::ae
+
+ae_with_seq <- ae %>%
+  arrange(USUBJID, AESTDTC) %>%        # sort before numbering
+  group_by(USUBJID) %>%
+  mutate(AESEQ = row_number()) %>%      # equivalent to RETAIN AESEQ + 1
+  ungroup()
+
+# Verify: max sequence per subject
+cat("AESEQ range:\n")
+ae_with_seq %>%
+  group_by(USUBJID) %>%
+  summarise(max_seq = max(AESEQ)) %>%
+  summarise(min_maxseq = min(max_seq), max_maxseq = max(max_seq)) %>%
+  print()
+
+# First 3 AEs for one subject
+ae_with_seq %>%
+  filter(USUBJID == first(USUBJID)) %>%
+  select(USUBJID, AESEQ, AESTDTC, AETERM) %>%
+  head(3) %>%
+  print()
+```
+
+### Exercise 3
+
+Write `impute_date(dtc, rule)` that imputes partial dates using first or last day of month.
+
+```r
+# SAS equivalent:
+# /* Impute first */
+# IF LENGTH(TRIM(DTC)) = 7 THEN DT_IMP = INPUT(CATS(DTC,"-01"), YYMMDD10.);
+# /* Impute last */
+# IF LENGTH(TRIM(DTC)) = 7 THEN DO;
+#   mo  = INPUT(SUBSTR(DTC,6,2), 2.);
+#   yr  = INPUT(SUBSTR(DTC,1,4), 4.);
+#   DT_IMP = INTNX("MONTH", MDY(mo,1,yr), 0, "END");
+# END;
+
+library(dplyr)
+library(lubridate)
+
+impute_date <- function(dtc, rule = "first") {
+  # dtc: ISO8601 character vector (complete "YYYY-MM-DD" or partial "YYYY-MM")
+  # rule: "first" → first of month, "last" → last of month
+  stopifnot(rule %in% c("first", "last"))
+
+  result <- character(length(dtc))
+
+  for (i in seq_along(dtc)) {
+    d <- dtc[i]
+    if (is.na(d) || d == "") {
+      result[i] <- NA_character_
+    } else if (grepl("^\\d{4}-\\d{2}-\\d{2}$", d)) {
+      result[i] <- d           # complete date — no imputation needed
+    } else if (grepl("^\\d{4}-\\d{2}$", d)) {
+      # Partial: YYYY-MM
+      yr <- as.integer(substr(d, 1, 4))
+      mo <- as.integer(substr(d, 6, 7))
+      if (rule == "first") {
+        result[i] <- sprintf("%04d-%02d-01", yr, mo)
+      } else {
+        last_day <- lubridate::days_in_month(as.Date(sprintf("%04d-%02d-01", yr, mo)))
+        result[i] <- sprintf("%04d-%02d-%02d", yr, mo, last_day)
+      }
+    } else {
+      result[i] <- NA_character_   # unrecognised format
+    }
+  }
+  as.Date(result)
+}
+
+# Test
+test_dtcs <- c("2014-03", "2014-12", "2014-03-15", NA, "2014-02")
+cat("First imputation:\n")
+print(impute_date(test_dtcs, "first"))
+cat("Last imputation:\n")
+print(impute_date(test_dtcs, "last"))
+# Expected:
+#  "2014-03-01" "2014-12-01" "2014-03-15"  NA  "2014-02-01"
+#  "2014-03-31" "2014-12-31" "2014-03-15"  NA  "2014-02-28"
+```
+
+### Exercise 4
+
+Find subjects with `RFXSTDTC` present vs. missing, and check their treatment arm.
+
+```r
+# SAS:
+# DATA dm2;
+#   SET dm;
+#   RFXSTDT = INPUT(RFXSTDTC, YYMMDD10.);
+#   MISSING_TRT = (MISSING(RFXSTDTC));
+#   FORMAT RFXSTDT DATE9.;
+# RUN;
+# PROC FREQ DATA=dm2; TABLES MISSING_TRT * ACTARM; RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+
+# Convert RFXSTDTC to Date
+dm_dates <- dm %>%
+  mutate(
+    RFXSTDT = as.Date(RFXSTDTC),
+    HAS_RFXSTDT = !is.na(RFXSTDT)
+  )
+
+cat("RFXSTDTC presence by arm:\n")
+dm_dates %>%
+  count(ACTARM, HAS_RFXSTDT) %>%
+  tidyr::pivot_wider(names_from = HAS_RFXSTDT, values_from = n,
+                     names_prefix = "has_rfxstdt_") %>%
+  print()
+
+# Subjects missing RFXSTDTC — what arm?
+missing_trt <- dm_dates %>%
+  filter(!HAS_RFXSTDT) %>%
+  select(USUBJID, ACTARM, RFXSTDTC)
+
+cat(sprintf("\nSubjects missing RFXSTDTC: %d\n", nrow(missing_trt)))
+cat("Their arms:\n")
+print(table(missing_trt$ACTARM))
+# Explanation: screen failures have ACTARM = "Screen Failure" and no exposure date
+# → TRTSDT derivation in Ch4 must handle these gracefully (result: NA TRTSDT)
+```

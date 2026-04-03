@@ -421,3 +421,228 @@ pharm001_ch06_adae.R     — complete ADAE (TEAE flag, severity flags, study day
 ---
 
 *Next: Chapter 7 — we build the demographics table. Start with one row (age N/mean/SD), add rows one by one.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add NCI CTCAE grade as `ATOXGR`, numeric `ATOXGRN`, and flag subjects with Grade 3+ events.
+
+```r
+# SAS:
+# DATA adae;
+#   SET adae;
+#   /* CTCAE grade from AETOXGR (numeric 1-5 in pharmaversesdtm) */
+#   ATOXGR  = AETOXGR;
+#   ATOXGRN = INPUT(AETOXGR, 8.);
+#   IF ATOXGRN >= 3 THEN GR3FL = "Y";
+#   ELSE                 GR3FL = "";
+# RUN;
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+ae   <- pharmaversesdtm::ae
+adsl <- pharmaverseadam::adsl
+
+adae <- ae %>%
+  left_join(
+    adsl %>% select(STUDYID, USUBJID, TRTSDT, TRTEDT, TRT01A, SAFFL),
+    by = c("STUDYID", "USUBJID")
+  ) %>%
+  derive_vars_dt(new_vars_prefix = "AST", dtc = AESTDTC, date_imputation = "first") %>%
+  derive_var_trtemfl(
+    new_var        = TRTEMFL,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = 30
+  ) %>%
+  mutate(
+    # CTCAE grade — AETOXGR is stored as character "1"-"5" in pharmaversesdtm
+    ATOXGR  = AETOXGR,
+    ATOXGRN = suppressWarnings(as.integer(AETOXGR)),
+    GR3FL   = if_else(!is.na(ATOXGRN) & ATOXGRN >= 3, "Y", NA_character_)
+  )
+
+# Summary
+n_gr3_subj <- adae %>%
+  filter(SAFFL == "Y", TRTEMFL == "Y", GR3FL == "Y") %>%
+  distinct(USUBJID) %>%
+  nrow()
+
+cat("Grade 3+ TEAE summary:\n")
+cat(sprintf("  Subjects with Grade 3+ TEAE: %d\n", n_gr3_subj))
+
+adae %>%
+  filter(SAFFL == "Y", TRTEMFL == "Y", GR3FL == "Y") %>%
+  count(ATOXGR, sort = TRUE) %>%
+  print()
+```
+
+### Exercise 2
+
+Compare naive TEAE definition vs. 30-day window — show which AEs differ.
+
+```r
+# SAS:
+# /* Naive */
+# IF ASTDT >= TRTSDT THEN TRTEMFL_NAIVE = "Y";
+# /* Correct with 30-day window */
+# IF ASTDT >= TRTSDT AND (MISSING(TRTEDT) OR ASTDT <= TRTEDT + 30)
+#    THEN TRTEMFL_CORRECT = "Y";
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+
+ae   <- pharmaversesdtm::ae
+adsl <- pharmaverseadam::adsl
+
+adae_compare <- ae %>%
+  left_join(
+    adsl %>% select(USUBJID, TRTSDT, TRTEDT, SAFFL),
+    by = "USUBJID"
+  ) %>%
+  filter(SAFFL == "Y") %>%
+  mutate(
+    ASTDT = as.Date(substr(AESTDTC, 1, 10)),
+
+    # Naive: on or after first dose (no end window)
+    TRTEMFL_NAIVE = case_when(
+      !is.na(ASTDT) & !is.na(TRTSDT) & ASTDT >= TRTSDT ~ "Y",
+      TRUE ~ NA_character_
+    ),
+
+    # Correct: on or after first dose AND within 30 days of last dose
+    TRTEMFL_CORRECT = case_when(
+      !is.na(ASTDT) & !is.na(TRTSDT) &
+        ASTDT >= TRTSDT &
+        (is.na(TRTEDT) | ASTDT <= TRTEDT + 30) ~ "Y",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Compare
+n_naive   <- sum(adae_compare$TRTEMFL_NAIVE    == "Y", na.rm = TRUE)
+n_correct <- sum(adae_compare$TRTEMFL_CORRECT  == "Y", na.rm = TRUE)
+n_diff    <- n_naive - n_correct
+
+cat(sprintf("Naive TEAE:   %d events\n", n_naive))
+cat(sprintf("Correct TEAE: %d events\n", n_correct))
+cat(sprintf("Difference:   %d events flagged by naive only\n", n_diff))
+
+# Show the extra events (flagged naive but not correct)
+extra <- adae_compare %>%
+  filter(TRTEMFL_NAIVE == "Y", is.na(TRTEMFL_CORRECT)) %>%
+  select(USUBJID, AEDECOD, AESTDTC, AEENDTC, ASTDT, TRTSDT, TRTEDT) %>%
+  mutate(DAYS_AFTER_TRTEDT = as.integer(ASTDT - TRTEDT))
+
+if (nrow(extra) > 0) {
+  cat(sprintf("\nAEs in naive but NOT in correct definition (%d events):\n", nrow(extra)))
+  print(head(extra, 10))
+}
+```
+
+### Exercise 3
+
+Build ADTTE for overall survival (`PARAMCD = "OS"`).
+
+```r
+# SAS:
+# DATA adtte_os;
+#   SET adsl;
+#   PARAMCD = "OS";
+#   PARAM   = "Overall Survival";
+#   AVALU   = "DAYS";
+#   /* Event: death */
+#   IF DTHFL = "Y" THEN DO;
+#     CNSR = 0; ADT = DTHDT; EVNTDESC = "Death";
+#   END;
+#   ELSE DO;
+#     CNSR = 1; ADT = TRTEDT; CNSDTDSC = "End of Treatment";
+#   END;
+#   AVAL = ADT - TRTSDT;
+#   FORMAT ADT DTHDT DATE9.;
+# RUN;
+
+library(dplyr)
+library(admiral)
+library(pharmaverseadam)
+
+adsl <- pharmaverseadam::adsl
+
+adtte_os <- adsl %>%
+  filter(SAFFL == "Y") %>%
+  mutate(
+    # Death date
+    DTHDT = as.Date(DTHDTC)
+  ) %>%
+  mutate(
+    PARAMCD  = "OS",
+    PARAM    = "Overall Survival",
+    AVALU    = "DAYS",
+    STARTDT  = TRTSDT,
+
+    # Event indicator: 0 = event (death), 1 = censored
+    CNSR     = if_else(!is.na(DTHFL) & DTHFL == "Y", 0L, 1L),
+
+    # Analysis date: death date if event, last contact if censored
+    ADT      = if_else(CNSR == 0L, DTHDT, TRTEDT),
+
+    # Analysis value in days from treatment start
+    AVAL     = as.numeric(ADT - TRTSDT),
+
+    EVNTDESC = if_else(CNSR == 0L, "Death", ""),
+    CNSDTDSC = if_else(CNSR == 1L, "End of Treatment", "")
+  ) %>%
+  select(STUDYID, USUBJID, TRT01A, TRT01AN, PARAMCD, PARAM, AVALU,
+         STARTDT, ADT, AVAL, CNSR, EVNTDESC, CNSDTDSC)
+
+cat("OS ADTTE summary:\n")
+cat(sprintf("  Rows: %d\n", nrow(adtte_os)))
+cat(sprintf("  Deaths (CNSR=0): %d\n", sum(adtte_os$CNSR == 0)))
+cat(sprintf("  Censored:        %d\n", sum(adtte_os$CNSR == 1)))
+cat(sprintf("  AVAL range: %.0f – %.0f days\n",
+            min(adtte_os$AVAL, na.rm=TRUE), max(adtte_os$AVAL, na.rm=TRUE)))
+```
+
+### Exercise 4
+
+Check that `TRT01A` arms match between ADSL and ADAE.
+
+```r
+# SAS:
+# PROC SQL; SELECT DISTINCT TRT01A FROM adsl; QUIT;
+# PROC SQL; SELECT DISTINCT TRT01A FROM adae; QUIT;
+
+library(dplyr)
+library(pharmaverseadam)
+
+adsl <- pharmaverseadam::adsl
+adae <- pharmaverseadam::adae
+
+arms_adsl <- sort(unique(adsl$TRT01A))
+arms_adae <- sort(unique(adae$TRT01A))
+
+cat("ADSL arms:\n"); print(arms_adsl)
+cat("ADAE arms:\n"); print(arms_adae)
+
+missing_from_adae <- setdiff(arms_adsl, arms_adae)
+extra_in_adae     <- setdiff(arms_adae, arms_adsl)
+
+if (length(missing_from_adae) == 0 && length(extra_in_adae) == 0) {
+  cat("\n✓ Arms match exactly between ADSL and ADAE\n")
+} else {
+  if (length(missing_from_adae) > 0)
+    cat("Arms in ADSL missing from ADAE:", paste(missing_from_adae, collapse=", "), "\n")
+  if (length(extra_in_adae) > 0)
+    cat("Extra arms in ADAE:", paste(extra_in_adae, collapse=", "), "\n")
+}
+# Note: an arm present in ADSL but not ADAE means no AEs were reported
+# for subjects in that arm — not a data error, but worth investigating
+```

@@ -396,3 +396,233 @@ The pipeline grows: `pharm001_ch04.R` produces the first ADaM-style variables.
 ---
 
 *Next: Chapter 5 — we build the complete ADSL. Every variable is motivated by the demographics table we'll produce in Chapter 7.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Add `SCRDT` (screening date from `RFICDTC`) and verify it precedes treatment start for all subjects.
+
+```r
+# SAS:
+# DATA adsl;
+#   SET adsl;
+#   SCRDT = INPUT(RFICDTC, YYMMDD10.);
+#   FORMAT SCRDT DATE9.;
+#   IF SCRDT >= TRTSDT AND NOT MISSING(TRTSDT) THEN
+#     PUT "WARNING: Screening not before treatment for " USUBJID=;
+# RUN;
+
+library(admiral)
+library(pharmaversesdtm)
+library(dplyr)
+
+dm <- pharmaversesdtm::dm %>% filter(ACTARM != "Screen Failure")
+
+adsl <- dm %>%
+  # Derive TRTSDT from exposure start
+  derive_vars_dt(
+    new_vars_prefix = "TRTS",
+    dtc             = RFXSTDTC,
+    date_imputation = "first"
+  ) %>%
+  # Derive SCRDT from informed consent date
+  derive_vars_dt(
+    new_vars_prefix = "SCR",
+    dtc             = RFICDTC,
+    date_imputation = "first"
+  )
+
+# Check: screening before treatment?
+bad_dates <- adsl %>%
+  filter(!is.na(SCRDT), !is.na(TRTSDT), SCRDT >= TRTSDT)
+
+cat(sprintf("Subjects with SCRDT >= TRTSDT: %d\n", nrow(bad_dates)))
+if (nrow(bad_dates) > 0) {
+  cat("Details:\n")
+  print(bad_dates %>% select(USUBJID, SCRDT, TRTSDT, ACTARM))
+}
+# Expected: 0 violations (screening always precedes treatment)
+```
+
+### Exercise 2
+
+Derive `TRTSDY` using `derive_vars_dy()` and verify subjects who started on their reference date have `TRTSDY = 1`.
+
+```r
+# SAS:
+# DATA adsl;
+#   SET adsl;
+#   /* CDISC study day: no day 0 */
+#   IF TRTSDT >= RFSTDT THEN TRTSDY =  TRTSDT - RFSTDT + 1;
+#   ELSE IF NOT MISSING(TRTSDT) AND NOT MISSING(RFSTDT)
+#                      THEN TRTSDY =  TRTSDT - RFSTDT;
+# RUN;
+# /* Verify: subjects where TRTSDT = RFSTDT have TRTSDY = 1 */
+# PROC PRINT DATA=adsl(WHERE=(TRTSDT = RFSTDT));
+#   VAR USUBJID TRTSDT RFSTDT TRTSDY;
+# RUN;
+
+library(admiral)
+library(pharmaversesdtm)
+library(dplyr)
+
+dm <- pharmaversesdtm::dm %>% filter(ACTARM != "Screen Failure")
+
+adsl <- dm %>%
+  # Need a reference date: use RFSTDTC
+  derive_vars_dt(
+    new_vars_prefix = "RFST",
+    dtc             = RFSTDTC,
+    date_imputation = "first"
+  ) %>%
+  derive_vars_dt(
+    new_vars_prefix = "TRTS",
+    dtc             = RFXSTDTC,
+    date_imputation = "first"
+  ) %>%
+  # Study day: CDISC convention (no day 0)
+  derive_vars_dy(
+    reference_date = RFSTDT,
+    source_vars    = exprs(TRTSDT)
+  )
+
+# Verify: subjects starting on their reference date → TRTSDY = 1
+same_day <- adsl %>%
+  filter(!is.na(TRTSDT), !is.na(RFSTDT), TRTSDT == RFSTDT)
+
+cat(sprintf("Subjects where TRTSDT == RFSTDT: %d\n", nrow(same_day)))
+cat(sprintf("All have TRTSDY = 1: %s\n",
+            all(same_day$TRTSDY == 1, na.rm = TRUE)))
+
+# Range of study days
+cat(sprintf("TRTSDY range: %d to %d\n",
+            min(adsl$TRTSDY, na.rm = TRUE),
+            max(adsl$TRTSDY, na.rm = TRUE)))
+```
+
+### Exercise 3
+
+Derive `EXSTDT_FIRST` from the `ex` domain and compare to `TRTSDT`.
+
+```r
+# SAS:
+# PROC SORT DATA=ex OUT=ex_first; BY USUBJID EXSTDTC; RUN;
+# DATA ex_first;
+#   SET ex_first;
+#   BY USUBJID;
+#   IF FIRST.USUBJID;
+#   EXSTDT = INPUT(EXSTDTC, YYMMDD10.);
+#   FORMAT EXSTDT DATE9.;
+# RUN;
+# DATA compare;
+#   MERGE adsl(KEEP=USUBJID TRTSDT) ex_first(KEEP=USUBJID EXSTDT);
+#   BY USUBJID;
+#   DIFF = TRTSDT - EXSTDT;
+# RUN;
+# PROC MEANS DATA=compare; VAR DIFF; RUN;
+
+library(admiral)
+library(pharmaversesdtm)
+library(dplyr)
+
+dm <- pharmaversesdtm::dm %>% filter(ACTARM != "Screen Failure")
+ex <- pharmaversesdtm::ex
+
+# Derive TRTSDT
+adsl <- dm %>%
+  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first")
+
+# First dose date per subject from EX
+ex_first_dose <- ex %>%
+  mutate(EXSTDT = as.Date(substr(EXSTDTC, 1, 10))) %>%
+  group_by(USUBJID) %>%
+  summarise(EXSTDT_FIRST = min(EXSTDT, na.rm = TRUE), .groups = "drop")
+
+# Compare
+comparison <- adsl %>%
+  select(USUBJID, TRTSDT) %>%
+  left_join(ex_first_dose, by = "USUBJID") %>%
+  filter(!is.na(TRTSDT), !is.na(EXSTDT_FIRST)) %>%
+  mutate(DIFF_DAYS = as.integer(TRTSDT - EXSTDT_FIRST))
+
+cat(sprintf("Subjects compared: %d\n", nrow(comparison)))
+cat(sprintf("Subjects where TRTSDT == EXSTDT_FIRST: %d\n",
+            sum(comparison$DIFF_DAYS == 0, na.rm = TRUE)))
+cat(sprintf("Subjects where TRTSDT != EXSTDT_FIRST: %d\n",
+            sum(comparison$DIFF_DAYS != 0, na.rm = TRUE)))
+
+# Show discrepancies if any
+discrepancies <- comparison %>% filter(DIFF_DAYS != 0)
+if (nrow(discrepancies) > 0) {
+  cat("Discrepant subjects (TRTSDT ≠ EXSTDT_FIRST):\n")
+  print(discrepancies)
+}
+```
+
+### Exercise 4
+
+Derive `AGEGR1`, `SEXN`, and `RACEN` for the demographics table.
+
+```r
+# SAS:
+# DATA adsl;
+#   SET adsl;
+#   IF      AGE < 40              THEN AGEGR1 = "<40";
+#   ELSE IF AGE >= 40 AND AGE < 65 THEN AGEGR1 = "40-64";
+#   ELSE IF AGE >= 65              THEN AGEGR1 = ">=65";
+#   IF      AGEGR1 = "<40"   THEN AGEGR1N = 1;
+#   ELSE IF AGEGR1 = "40-64" THEN AGEGR1N = 2;
+#   ELSE IF AGEGR1 = ">=65"  THEN AGEGR1N = 3;
+#   IF SEX = "M" THEN SEXN = 1; ELSE IF SEX = "F" THEN SEXN = 2;
+#   IF      RACE = "WHITE"                             THEN RACEN = 1;
+#   ELSE IF RACE = "BLACK OR AFRICAN AMERICAN"         THEN RACEN = 2;
+#   ELSE IF RACE = "ASIAN"                             THEN RACEN = 3;
+#   ELSE                                                    RACEN = 99;
+# RUN;
+
+library(dplyr)
+library(admiral)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm %>% filter(ACTARM != "Screen Failure")
+
+adsl <- dm %>%
+  mutate(
+    AGEGR1 = case_when(
+      AGE < 40              ~ "<40",
+      AGE >= 40 & AGE < 65  ~ "40-64",
+      AGE >= 65             ~ ">=65",
+      TRUE                  ~ NA_character_
+    ),
+    AGEGR1N = case_when(
+      AGEGR1 == "<40"   ~ 1L,
+      AGEGR1 == "40-64" ~ 2L,
+      AGEGR1 == ">=65"  ~ 3L
+    ),
+    SEXN = case_when(
+      SEX == "M" ~ 1L,
+      SEX == "F" ~ 2L,
+      TRUE       ~ NA_integer_
+    ),
+    RACEN = case_when(
+      RACE == "WHITE"                             ~ 1L,
+      RACE == "BLACK OR AFRICAN AMERICAN"         ~ 2L,
+      RACE == "ASIAN"                             ~ 3L,
+      RACE == "AMERICAN INDIAN OR ALASKA NATIVE"  ~ 4L,
+      RACE == "MULTIPLE"                          ~ 6L,
+      RACE == "UNKNOWN"                           ~ 7L,
+      TRUE                                        ~ 99L
+    )
+  )
+
+# Verify
+cat("AGEGR1 distribution:\n")
+print(count(adsl, AGEGR1, AGEGR1N))
+cat("\nSEX / SEXN check (should be 1-to-1):\n")
+print(table(adsl$SEX, adsl$SEXN))
+cat("\nRACEN distribution:\n")
+print(count(adsl, RACE, RACEN) %>% arrange(RACEN))
+```

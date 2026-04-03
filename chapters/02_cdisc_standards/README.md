@@ -319,3 +319,178 @@ source("pharm001_ch01.R")
 ---
 
 *Next: Chapter 3 — we take raw data and use sdtm.oak to produce SDTM-compliant domains for PHARM-001.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Find all `*DTC` variables and count partial dates (YYYY-MM pattern) in each domain.
+
+```r
+# SAS equivalent:
+# /* Find all date variables */
+# PROC CONTENTS DATA=dm OUT=dm_meta; RUN;
+# DATA dtc_vars; SET dm_meta; WHERE INDEX(NAME, "DTC") > 0; RUN;
+# /* Count partial dates — LENGTH = 7 means "YYYY-MM" */
+# DATA dm2; SET dm; len_rfstdtc = LENGTH(TRIM(RFSTDTC)); RUN;
+# PROC FREQ DATA=dm2; TABLES len_rfstdtc; RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+ae <- pharmaversesdtm::ae
+vs <- pharmaversesdtm::vs
+ex <- pharmaversesdtm::ex
+
+count_partial_dates <- function(df, domain_name) {
+  dtc_vars <- names(df)[grepl("DTC$", names(df))]
+  if (length(dtc_vars) == 0) {
+    cat(sprintf("%-5s: no *DTC variables\n", domain_name))
+    return(invisible(NULL))
+  }
+  partial_pattern <- "^\\d{4}-\\d{2}$"   # YYYY-MM only
+  for (v in dtc_vars) {
+    vals     <- df[[v]][!is.na(df[[v]]) & df[[v]] != ""]
+    n_total  <- length(vals)
+    n_partial <- sum(grepl(partial_pattern, vals))
+    cat(sprintf("  %-25s: %4d total, %3d partial (%.1f%%)\n",
+                paste0(domain_name, "$", v),
+                n_total, n_partial,
+                if (n_total > 0) 100 * n_partial / n_total else 0))
+  }
+}
+
+cat("=== Partial Date Summary (YYYY-MM pattern) ===\n")
+count_partial_dates(dm, "DM")
+count_partial_dates(ae, "AE")
+count_partial_dates(vs, "VS")
+count_partial_dates(ex, "EX")
+```
+
+### Exercise 2
+
+Write a generic CT validation function that returns a data frame of violations.
+
+```r
+# SAS equivalent:
+# PROC FORMAT; VALUE $SEXCT 'M'='ok' 'F'='ok' 'U'='ok' OTHER='VIOLATION'; RUN;
+# DATA violations; SET dm;
+#   IF PUT(SEX,$SEXCT.) = 'VIOLATION' THEN OUTPUT;
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+dm <- pharmaversesdtm::dm
+ae <- pharmaversesdtm::ae
+
+# Function: returns data frame of CT violations
+validate_ct <- function(df, var, allowed) {
+  if (!var %in% names(df)) {
+    warning(sprintf("Variable '%s' not found in data frame", var))
+    return(data.frame())
+  }
+  df %>%
+    filter(!is.na(.data[[var]]), !.data[[var]] %in% allowed) %>%
+    mutate(variable = var, bad_value = as.character(.data[[var]])) %>%
+    select(USUBJID, variable, bad_value)
+}
+
+# Check SEX in DM
+sex_violations <- validate_ct(dm, "SEX", c("M","F","U","UNDIFFERENTIATED"))
+cat(sprintf("SEX violations: %d\n", nrow(sex_violations)))
+
+# Check AESER in AE
+aeser_violations <- validate_ct(ae, "AESER", c("Y","N"))
+cat(sprintf("AESER violations: %d\n", nrow(aeser_violations)))
+
+# If violations exist, print them
+if (nrow(sex_violations) > 0) print(sex_violations)
+```
+
+### Exercise 3
+
+Map `DSDECOD` to a three-level completion status.
+
+```r
+# SAS:
+# DATA ds2;
+#   SET ds;
+#   IF      DSDECOD = "COMPLETED"  THEN STATUS = "COMPLETED";
+#   ELSE IF DSDECOD IN ("WITHDRAWAL BY SUBJECT","ADVERSE EVENT",
+#                       "LACK OF EFFICACY") THEN STATUS = "WITHDRAWN";
+#   ELSE                                         STATUS = "OTHER";
+# RUN;
+
+library(dplyr)
+library(pharmaversesdtm)
+
+ds <- pharmaversesdtm::ds
+
+ds_status <- ds %>%
+  mutate(
+    COMPLETION_STATUS = case_when(
+      DSDECOD == "COMPLETED"                              ~ "COMPLETED",
+      DSDECOD %in% c("WITHDRAWAL BY SUBJECT",
+                     "ADVERSE EVENT",
+                     "LACK OF EFFICACY",
+                     "LOST TO FOLLOW-UP",
+                     "DEATH",
+                     "PHYSICIAN DECISION")               ~ "WITHDRAWN",
+      TRUE                                                ~ "OTHER"
+    )
+  )
+
+cat("Disposition status breakdown:\n")
+print(count(ds_status, COMPLETION_STATUS))
+```
+
+### Exercise 4
+
+Compare `pharmaverseraw::dm_raw$GENDER` to `pharmaversesdtm::dm$SEX` and write a mapping function.
+
+```r
+# SAS:
+# /* Check raw vs SDTM values */
+# PROC FREQ DATA=raw_dm; TABLES GENDER; RUN;
+# PROC FREQ DATA=dm;     TABLES SEX;    RUN;
+
+library(dplyr)
+
+# Note: pharmaverseraw may need to be installed separately
+# install.packages("pharmaverseraw")
+library(pharmaverseraw)
+library(pharmaversesdtm)
+
+raw_dm <- pharmaverseraw::dm_raw
+sdtm_dm <- pharmaversesdtm::dm
+
+cat("Raw GENDER values:\n")
+print(table(raw_dm$GENDER, useNA = "always"))
+
+cat("\nSDTM SEX values:\n")
+print(table(sdtm_dm$SEX, useNA = "always"))
+
+# Mapping function — case-insensitive for robustness
+# SAS: automatically case-insensitive; R: must handle explicitly
+map_sex <- function(raw_val) {
+  val_up <- toupper(trimws(raw_val))
+  dplyr::case_when(
+    val_up == "MALE"             ~ "M",
+    val_up == "FEMALE"           ~ "F",
+    val_up == "UNKNOWN"          ~ "U",
+    val_up %in% c("1", "M")     ~ "M",
+    val_up %in% c("2", "F")     ~ "F",
+    TRUE                          ~ NA_character_
+  )
+}
+
+# Verify mapping
+cat("\nMapping check:\n")
+test_vals <- c("Male","Female","MALE","FEMALE","male","Unknown","")
+mapped    <- map_sex(test_vals)
+data.frame(raw = test_vals, sdtm = mapped) %>% print()
+```

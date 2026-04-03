@@ -440,3 +440,213 @@ renv.lock
 ---
 
 *Next: Chapter 12 — the complete PHARM-001 pipeline. `run_all.R` executes everything in order.*
+
+---
+
+## Solutions
+
+### Exercise 1
+
+Wrap `pharm001_ch05_adsl.R` in `axecute()` and review the log.
+
+```r
+# SAS: Every SAS program automatically generates a .log file.
+# R: logrx::axecute() provides an equivalent audit trail.
+
+library(logrx)
+
+# Create a minimal ADSL program to axecute
+adsl_script <- tempfile(fileext = ".R")
+writeLines(c(
+  'library(admiral)',
+  'library(pharmaversesdtm)',
+  'library(pharmaverseadam)',
+  'library(dplyr)',
+  'library(logrx)',
+  '',
+  'log_print("=== PHARM-001 ADSL (Ch11 version) — START ===")',
+  '',
+  'dm <- pharmaversesdtm::dm',
+  'log_print(sprintf("DM: %d rows", nrow(dm)))',
+  '',
+  'adsl <- dm %>%',
+  '  filter(ACTARM != "Screen Failure") %>%',
+  '  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first") %>%',
+  '  derive_vars_dt(new_vars_prefix = "TRTE", dtc = RFXENDTC,  date_imputation = "last") %>%',
+  '  mutate(TRTDURD = as.integer(TRTEDT - TRTSDT + 1))',
+  '',
+  'n_trtsdt_na <- sum(is.na(adsl$TRTSDT))',
+  'if (n_trtsdt_na > 0)',
+  '  log_print(sprintf("NOTE: %d subjects missing TRTSDT", n_trtsdt_na))',
+  '',
+  'log_print(sprintf("ADSL: %d rows", nrow(adsl)))',
+  'log_print("=== PHARM-001 ADSL — COMPLETE ===")'
+), adsl_script)
+
+# Run via axecute()
+dir.create("logs", showWarnings = FALSE)
+log_path <- "logs/adsl_ch11.log"
+logrx::axecute(adsl_script, log = log_path)
+
+# Read and print the log
+cat("=== Log file contents ===\n")
+cat(readLines(log_path), sep = "\n")
+
+cat("\nCheck the log for:\n")
+cat("  - R version captured\n")
+cat("  - Package versions listed (admiral, dplyr, etc.)\n")
+cat("  - log_print() messages included\n")
+cat("  - Warnings section (empty = no warnings)\n")
+cat("  - Program Status: Success\n")
+```
+
+### Exercise 2
+
+Introduce a deliberate warning and confirm it appears in the log.
+
+```r
+# SAS: WARNING: messages appear automatically in the SAS .log file.
+# R: logrx captures all warning() calls in the Warnings section of the log.
+
+library(logrx)
+
+warning_test_script <- tempfile(fileext = ".R")
+writeLines(c(
+  'library(dplyr)',
+  'library(logrx)',
+  'library(pharmaversesdtm)',
+  'library(admiral)',
+  '',
+  '# Deliberate warning to test logrx capture',
+  'warning("Testing logrx: this warning should appear in the log")',
+  '',
+  'dm <- pharmaversesdtm::dm %>% filter(ACTARM != "Screen Failure")',
+  'adsl <- dm %>%',
+  '  derive_vars_dt(new_vars_prefix = "TRTS", dtc = RFXSTDTC, date_imputation = "first")',
+  '',
+  'n_missing_trtsdt <- sum(is.na(adsl$TRTSDT))',
+  'if (n_missing_trtsdt > 0)',
+  '  warning(sprintf("ADSL: %d subjects have missing TRTSDT", n_missing_trtsdt))',
+  '',
+  'cat(sprintf("ADSL rows: %d\\n", nrow(adsl)))'
+), warning_test_script)
+
+dir.create("logs", showWarnings = FALSE)
+log_path <- "logs/warning_test.log"
+logrx::axecute(warning_test_script, log = log_path)
+
+# Verify warning appears in log
+log_lines <- readLines(log_path)
+warning_lines <- log_lines[grep("Warning|WARNING|warning", log_lines)]
+
+cat("Warning-related log lines:\n")
+if (length(warning_lines) > 0) {
+  cat(warning_lines, sep = "\n")
+  cat("\n[PASS] Warning captured in log.\n")
+} else {
+  cat("[INFO] No warnings found in log (no missing TRTSDT in pharmaversesdtm).\n")
+}
+```
+
+### Exercise 3
+
+Create an `renv` lockfile for PHARM-001.
+
+```r
+# SAS: renv.lock is equivalent to documenting the SAS version + SAS/STAT version
+# + macro catalog version. SAS does not have an automated version lock mechanism.
+
+library(renv)
+
+# Initialize renv in a temporary project directory
+proj_dir <- file.path(tempdir(), "pharm001_renv_test")
+dir.create(proj_dir, recursive = TRUE)
+
+# Note: Run these commands in your actual project root (~/Projects/r-pharmaverse/):
+cat("=== renv Setup for PHARM-001 ===\n\n")
+cat("Run these commands in your project root:\n\n")
+cat("# 1. Initialize renv (first time only)\n")
+cat("renv::init()\n\n")
+cat("# 2. Install core pharmaverse packages\n")
+cat('install.packages(c(\n')
+cat('  "admiral", "pharmaversesdtm", "pharmaverseadam",\n')
+cat('  "rtables", "tern", "xportr", "diffdf", "logrx",\n')
+cat('  "cards", "tfrmt", "gtsummary", "rlistings"\n')
+cat('))\n\n')
+cat("# 3. Snapshot installed packages to renv.lock\n")
+cat("renv::snapshot()\n\n")
+cat("# 4. Check status\n")
+cat("renv::status()\n\n")
+cat("# 5. On a new machine or clean environment:\n")
+cat("renv::restore()  # installs exactly the locked versions\n\n")
+
+# Show what the lockfile contains
+cat("=== renv.lock contains ===\n")
+cat("  - R version\n")
+cat("  - Package name, version, source, hash\n")
+cat("  - All dependencies (transitive)\n")
+cat("  - Repository URLs\n\n")
+cat("Commit renv.lock to git → everyone gets identical package versions.\n")
+cat("SAS equivalent: documenting SAS version + PROC versions in the header of each .sas file.\n")
+```
+
+### Exercise 4
+
+Write a `run_all.R` seed using `axecute()` for every program in order.
+
+```r
+# SAS equivalent: master run_all.sas using %INCLUDE for each program.
+# logrx::axecute() is the R equivalent of %INCLUDE + automatic .log generation.
+
+library(logrx)
+
+# ---- Seed for run_all.R (Chapter 12 will extend this) ----
+
+# Config
+PROG_DIR <- "programs"
+LOG_DIR  <- "logs"
+
+dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Pipeline order (must match SDTM → ADaM → TLG dependency chain)
+# SAS equivalent:
+# %INCLUDE "programs/sdtm/validate.sas";
+# %INCLUDE "programs/adam/adsl.sas";
+# ... etc.
+
+programs <- list(
+  list(path = file.path(PROG_DIR, "pharm001_ch02_validate.R"), label = "SDTM Validation"),
+  list(path = file.path(PROG_DIR, "pharm001_ch03_dm.R"),       label = "SDTM DM Mapping"),
+  list(path = file.path(PROG_DIR, "pharm001_ch11_adsl.R"),     label = "ADaM ADSL"),
+  list(path = file.path(PROG_DIR, "pharm001_ch06_adae.R"),     label = "ADaM ADAE"),
+  list(path = file.path(PROG_DIR, "pharm001_ch09_export.R"),   label = "XPT Export"),
+  list(path = file.path(PROG_DIR, "pharm001_ch07_t14_1_1.R"),  label = "Table 14.1.1"),
+  list(path = file.path(PROG_DIR, "pharm001_ch08_t14_3_1.R"),  label = "Table 14.3.1")
+)
+
+cat("=== PHARM-001 Run All (seed) ===\n")
+cat(sprintf("Programs to run: %d\n\n", length(programs)))
+
+for (prog in programs) {
+  prog_name <- tools::file_path_sans_ext(basename(prog$path))
+  log_file  <- file.path(LOG_DIR, paste0(prog_name, ".log"))
+
+  if (!file.exists(prog$path)) {
+    cat(sprintf("  [SKIP] %s — file not found: %s\n", prog$label, prog$path))
+    next
+  }
+
+  cat(sprintf("  Running: %s ... ", prog$label))
+  result <- tryCatch({
+    logrx::axecute(prog$path, log = log_file)
+    cat("OK\n")
+    TRUE
+  }, error = function(e) {
+    cat(sprintf("FAIL: %s\n", conditionMessage(e)))
+    FALSE
+  })
+}
+
+cat("\nAll programs attempted. Check logs/ for details.\n")
+cat("See Chapter 12 for the complete run_all.R with dependency checks.\n")
+```
